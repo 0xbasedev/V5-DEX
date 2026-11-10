@@ -5,6 +5,7 @@
   python3 -m sim.run --set floor=0.6 --set horizon_days=14
   python3 -m sim.run --sweep               floor x horizon grid, written to sim/out/sweep-<scenario>.csv
   python3 -m sim.run --sweep fees          gross fee x venue cut grid, written to sim/out/fees-<scenario>.csv
+  python3 -m sim.run --sweep lock --scenario hardlock    lock boost x exit cost grid
   python3 -m sim.run --seeds 20            average over more random runs
 """
 
@@ -47,11 +48,14 @@ ROWS = [
     ("accepted_medium_pct", "Medium, stays weeks"),
     ("accepted_long_pct", "Long, stays months"),
     ("accepted_long_late_pct", "Long, arriving in the second half"),
+    ("lock_take_pct", "Capital that could lock and did (%)"),
     ("What LPs earned from fees (APR %)", None),
     ("apr_anchor", "Anchor tenants"),
     ("apr_long", "Long"),
     ("apr_medium", "Medium"),
     ("apr_hot", "Hot"),
+    ("apr_locked", "Locked positions"),
+    ("apr_unlocked_long", "Long, not locked"),
     ("new_vs_mature_pct", "New dollar vs seasoned dollar, first horizon (%)"),
     ("After price moves (APR %)", None),
     ("net_apr_anchor", "Anchor tenants"),
@@ -133,6 +137,31 @@ def sweep_fees(p, seeds, name):
     print(f"\nFull results: {path}  (the competitor starts at {p.competitor_fee_pct:g}% and {how})")
 
 
+def sweep_lock(p, seeds, name):
+    """Weight boost for a locked position by the cost of leaving early."""
+    if not p.hard_lock_days:
+        raise SystemExit("this scenario has no hard lock; try --scenario hardlock")
+    boosts = [1.1, 1.25, 1.5, 2.0, 3.0]
+    exits = [2, 5, 10, 20]
+    cols = ["lock_take_pct", "hard_share_pct", "tvl_avg", "shock_retained_pct", "apr_locked",
+            "apr_unlocked_long", "principal_tolls", "pol_value"]
+    os.makedirs("sim/out", exist_ok=True)
+    path = f"sim/out/lock-{name}.csv"
+    print(f"{'boost':>6}{'exit %':>7}" + "".join(f"{c:>19}" for c in cols))
+    with open(path, "w", newline="") as fh:
+        writer = None
+        for boost in boosts:
+            for cost in exits:
+                r = average(p.but(hard_boost=boost, hard_exit_pct=cost), seeds)
+                row = dict(hard_boost=boost, hard_exit_pct=cost, **r)
+                if writer is None:
+                    writer = csv.DictWriter(fh, fieldnames=list(row))
+                    writer.writeheader()
+                writer.writerow(row)
+                print(f"{boost:>6g}{cost:>7}" + "".join(f"{fmt(c, r[c]):>19}" for c in cols))
+    print(f"\nFull results: {path}  ({p.hard_lock_days:g}-day lock)")
+
+
 def sweep(p, seeds, name):
     floors = [0.2, 0.4, 0.6, 0.8, 1.0]
     horizons = [7, 14, 28, 56]
@@ -157,11 +186,11 @@ def sweep(p, seeds, name):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", nargs="?", const="seasoning", choices=["seasoning", "fees"])
+    ap.add_argument("--sweep", nargs="?", const="seasoning", choices=["seasoning", "fees", "lock"])
     ap.add_argument("--scenario", choices=sorted(SCENARIOS), default="stable")
     ap.add_argument("--seeds", type=int, default=8)
     ap.add_argument("--set", action="append", default=[], metavar="name=value")
     args = ap.parse_args()
     params = Params().but(**SCENARIOS[args.scenario]).but(**parse_sets(args.set))
-    job = {"seasoning": sweep, "fees": sweep_fees, None: scenario}[args.sweep]
+    job = {"seasoning": sweep, "fees": sweep_fees, "lock": sweep_lock, None: scenario}[args.sweep]
     job(params, args.seeds, args.scenario)

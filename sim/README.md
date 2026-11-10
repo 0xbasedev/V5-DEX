@@ -9,6 +9,7 @@ python3 -m sim.run                       # the stable scenario against a plain p
 python3 -m sim.run --scenario shock      # stable | tight | volatile | shock | hardlock
 python3 -m sim.run --sweep               # floor x horizon grid -> sim/out/sweep-<scenario>.csv
 python3 -m sim.run --sweep fees          # gross fee x venue cut grid -> sim/out/fees-<scenario>.csv
+python3 -m sim.run --sweep lock --scenario hardlock   # lock boost x exit cost grid
 python3 -m sim.run --set floor=0.6 --set horizon_days=14 --seeds 20
 ```
 
@@ -73,7 +74,9 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - A moving price adds the trading needed to keep the pool at the market price, less the moves too small to be worth arbitraging past the fee.
 - LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate, plus the expected loss to price moves. They leave when their planned stay ends.
 - In a shock, 60% of LPs do nothing. Each of the rest fears losing up to 5% of their position and leaves if that fear is larger than what leaving costs them.
-- A hard-locked position seasons on the same ramp with a weight multiplier, and pays a share of principal to leave early that melts to zero over the term. An LP takes the lock only if it plans to stay the whole term and the lock pays enough more.
+- A hard-locked position seasons on the same ramp with a weight multiplier, and pays a share of principal to leave early that melts to zero over the term.
+- Each LP has their own chance of unexpectedly needing their money back (`liquidity_need_per_year` on average, spread widely between LPs). When the need comes they leave, whatever tier they are in, so locked LPs sometimes pay the toll in calm times too.
+- An LP prices the lock from that chance: the odds of needing out before the term ends, times the toll they would pay then, weighed `lock_aversion` times over. They take the lock only if they plan to stay the whole term and the extra yield beats that price.
 - `toll_mode` sets where a lock's exit toll goes. 0 is spec §18.3: a POL share, the rest to all seasoned weight. 1 pays it all to LPs locked before the exit, each toll paid out over one lock term and lost by a receiver who leaves first. 2 is the same, except the credit unlocks over the receiver's own lock term.
 - Anchor tenants are in from day one and never leave.
 - The venue's POL line, and the POL share of forfeits and tolls, are deposited as liquidity daily.

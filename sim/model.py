@@ -27,7 +27,6 @@ class Params:
     hard_lock_days: float = 0
     hard_boost: float = 1.5          # weight multiplier for a locked position
     hard_exit_pct: float = 5         # principal cost of leaving at day zero, melting to zero at the end of the term
-    lock_premium_pct: float = 2      # extra APR an LP wants before accepting a lock
     toll_mode: int = 0               # where a lock's exit toll goes:
                                      #   0  spec §18.3: a POL share, the rest to all seasoned weight
                                      #   1  all to LPs locked before the exit, each toll paid out over one lock term
@@ -90,6 +89,9 @@ class Params:
     hold_long: tuple = (90, 365)
     outside_apr_pct: float = 6           # what an LP can earn elsewhere, mean
     outside_apr_sd: float = 2
+    liquidity_need_per_year: float = 0.5  # how often the average LP unexpectedly needs their money back; each LP
+                                          # has their own rate, spread around this. 0 means nobody ever does.
+    lock_aversion: float = 1.5            # LPs weigh the expected cost of being locked this many times over
 
     seed: int = 0
 
@@ -364,6 +366,18 @@ def run(p: Params):
         for g, (was, now) in groups.items():
             shock[f"{tag}_kept_{g}_pct"] = 100 * now / was if was else float("nan")
 
+    lock_offered = [0.0, 0.0]   # capital that could have locked, and capital that did
+
+    def lock_price(need, T):
+        """What a lock costs an LP, as APR over their planned stay: the chance they
+        need out before the term ends, times the toll they would pay then, weighed
+        by how much they dislike that risk."""
+        if not need:
+            return 0.0
+        x = need * term / per_year   # expected number of needs during the term
+        expected_toll = p.hard_exit_pct * (1 - (1 - math.exp(-x)) / x)
+        return p.lock_aversion * expected_toll * per_year / T
+
     open_position("anchor", p.anchor_tvl, None)
     gross0 = organic_volume(tvl()) / E * p.gross_fee_pct / 100
     market_seen[:] = [0.0, 0.0, 0.0]
@@ -407,17 +421,26 @@ def run(p: Params):
             second_half = kind == "long" and day >= p.days // 2
             if second_half:
                 late[0] += size
+            # Each LP has their own chance of unexpectedly needing the money back.
+            need = rng.expovariate(1 / p.liquidity_need_per_year) if p.liquidity_need_per_year else 0.0
             soft = expected_apr(size, T, "soft")
             tier = None
-            if term and T >= term and expected_apr(size, T, "hard") >= max(hurdle, soft) + p.lock_premium_pct:
-                tier = "hard"
-            elif soft >= hurdle:
+            if term and T >= term:
+                lock_offered[0] += size
+                if expected_apr(size, T, "hard") - lock_price(need, T) >= max(hurdle, soft):
+                    tier = "hard"
+                    lock_offered[1] += size
+            if tier is None and soft >= hurdle:
                 tier = "soft"
             if tier:
                 accepted[kind] += size
                 if second_half:
                     late[1] += size
-                open_position(kind, size, T, tier)
+                stay = T
+                if need:
+                    surprise = round(rng.expovariate(need) * per_year)   # when the need actually arrives
+                    stay = max(1, min(T, surprise))
+                open_position(kind, size, stay, tier)
 
         # The venue's POL line, and its share of forfeits and tolls, go in as liquidity.
         pol_cash += hall.pol - pol_seen
@@ -485,6 +508,10 @@ def run(p: Params):
         rows = [r for r in done if r["kind"] == kind]
         out["apr_" + kind] = apr(rows, False)
         out["net_apr_" + kind] = apr(rows, True)
+    lps = [r for r in done if r["kind"] in KINDS]
+    out["apr_locked"] = apr([r for r in lps if r["tier"] == "hard"], False)
+    out["apr_unlocked_long"] = apr([r for r in lps if r["tier"] == "soft" and r["kind"] == "long"], False)
+    out["lock_take_pct"] = 100 * lock_offered[1] / lock_offered[0] if lock_offered[0] else float("nan")
     pol = [r for r in done if r["kind"] == "pol"]
     out["pol_income"] = sum(r["fees"] for r in pol)
     out["pol_value"] = sum(r["s"] for r in pol) * index()

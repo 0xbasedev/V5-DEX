@@ -63,6 +63,21 @@ class ModelChecks(unittest.TestCase):
         self.assertLess(market_volume(p.but(demand_elasticity=2), dear), market_volume(p, dear))
         self.assertEqual(market_volume(p.but(demand_elasticity=0), dear), p.market_daily_volume)
 
+    def test_lps_price_the_lock(self):
+        base = Params(days=150, seed=2).but(**SCENARIOS["hardlock"])
+        take = lambda **kw: run(base.but(**kw))[0]["lock_take_pct"]
+        # A dearer exit, a smaller boost, more need for cash or more dislike of risk: fewer take the lock.
+        self.assertLess(take(hard_exit_pct=20), take(hard_exit_pct=2))
+        self.assertLess(take(hard_boost=1.05), take(hard_boost=2.0))
+        self.assertLess(take(liquidity_need_per_year=2.0), take(liquidity_need_per_year=0.1))
+        self.assertLess(take(lock_aversion=4.0), take(lock_aversion=0.5))
+        # With nobody ever needing cash, the lock costs an LP nothing and tolls only arise in the shock.
+        calm = run(base.but(liquidity_need_per_year=0, shock_day=-1))[0]
+        self.assertEqual(calm["principal_tolls"], 0)
+        # With needs, some locked LPs pay to leave even in calm times.
+        needy = run(base.but(shock_day=-1))[0]
+        self.assertGreater(needy["principal_tolls"], 0)
+
     def test_competitor_depth_follows_its_yield(self):
         fixed, _ = run(Params(days=120))
         self.assertEqual(fixed["rival_tvl_end"], Params().competitor_tvl)
