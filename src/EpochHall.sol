@@ -17,8 +17,12 @@ pragma solidity 0.8.28;
 /// positions mature. `sim/hall.py` is the reference; `test/EpochHall.t.sol`
 /// checks this contract against a brute-force calculation.
 ///
+/// Every setting can be changed, and a change only ever applies to positions
+/// opened after it: each position carries the terms it was opened under. So
+/// no change can raise the cost of leaving for someone already in.
+///
 /// First cut. Not here yet: compounding, deferred claims on the banked half,
-/// tolls paid to lockers, an ERC-721 surface. Not audited.
+/// an ERC-721 surface. Not audited.
 abstract contract EpochHall {
     uint256 internal constant WAD = 1e18;
     uint256 internal constant TOKENS = 2;
@@ -28,23 +32,32 @@ abstract contract EpochHall {
     uint8 public constant SOFT = 0;
     uint8 public constant HARD = 1;
 
-    /// Seconds per epoch, and the time epoch 0 began.
+    /// Seconds per epoch, and the time epoch 0 began. These two cannot change.
     uint256 public immutable epochLength;
     uint256 public immutable startTime;
-    /// Weight of a brand-new position as a share of full weight (WAD).
-    uint256 public immutable floorWad;
-    /// Epochs to full weight.
-    uint256 public immutable horizon;
-    /// Share of earned fees unlocked at age zero (WAD).
-    uint256 public immutable unlockedAtZeroWad;
-    /// Share of forfeits and tolls that goes to protocol-owned liquidity (WAD).
-    uint256 public immutable polShareWad;
-    /// Hard tier: epochs locked (0 switches the tier off), cost of leaving on
-    /// the first day as a share of principal (WAD), and whether a locked
-    /// position starts fully seasoned.
-    uint256 public immutable lockTerm;
-    uint256 public immutable lockExitWad;
-    bool public immutable lockSkipsRamp;
+
+    struct HallConfig {
+        /// Weight of a brand-new position as a share of full weight (WAD).
+        uint256 floorWad;
+        /// Epochs to full weight.
+        uint256 horizon;
+        /// Share of earned fees unlocked at age zero (WAD). 1e18 switches the fee hold off.
+        uint256 unlockedAtZeroWad;
+        /// Share of forfeited fees that goes to protocol-owned liquidity (WAD); the rest goes to the LPs who stay.
+        uint256 polShareWad;
+        /// Hard tier: epochs locked. 0 switches the tier off.
+        uint256 lockTerm;
+        /// Hard tier: cost of leaving on the first day, as a share of principal (WAD).
+        uint256 lockExitWad;
+        /// Hard tier: how far that cost melts within the term. 0 melts to nothing, 1e18 never melts.
+        uint256 lockMeltFloorWad;
+        /// Hard tier: a locked position starts with full weight and no fee hold.
+        bool lockSkipsRamp;
+        /// Share of a lock's exit toll that goes to protocol-owned liquidity (WAD); the rest goes to locked LPs.
+        uint256 tollPolShareWad;
+    }
+
+    HallConfig internal _hallConfig;
 
     struct Position {
         address owner;
@@ -53,11 +66,17 @@ abstract contract EpochHall {
         uint64 settledTo; // earnings are settled for every epoch before this one
         uint64 lockEnd; // hard tier: first epoch it may leave free
         uint64 tollWad; // hard tier: exit cost written in when the position opened
+        uint64 unlockedAtZeroWad; // the terms it opened under, from here down
+        uint32 horizon;
+        uint32 lockTerm;
+        uint64 meltFloorWad;
         uint128 shares;
         uint128 baseWeight; // weight at age zero
         uint128 weightPerEpoch; // added each epoch until the horizon
         uint256[2] earned; // fees earned over the position's life
         uint256[2] paid; // fees already paid out
+        uint256[2] tollMark; // where the lockers' toll sums stood when last settled
+        uint256[2] tollOwed; // its share of tolls paid to lockers, not yet collected
     }
 
     struct Checkpoint {
@@ -79,12 +98,17 @@ abstract contract EpochHall {
     /// Fees that arrived during the current epoch, per token.
     uint256[2] public pending;
 
+    /// Shares held in the hard tier, and what has been paid to them per share (WAD-scaled).
+    uint256 public lockedShares;
+    uint256[2] internal _tollPerLockedShare;
+
     uint256[2] internal _a;
     uint256[2] internal _b;
     /// Epochs at which the running sums changed, and their values from then on.
     uint64[] internal _checkpointEpochs;
     mapping(uint256 => Checkpoint) internal _checkpoints;
 
+    event HallConfigSet(HallConfig config);
     event Opened(uint256 indexed id, address indexed owner, uint256 shares, uint8 tier);
     event Closed(uint256 indexed id, address indexed owner, uint256 shares, uint256 tollShares);
     event Paid(uint256 indexed id, address indexed to, uint256 amount0, uint256 amount1);
@@ -98,31 +122,25 @@ abstract contract EpochHall {
     error TierUnavailable();
     error BadConfig();
 
-    struct HallConfig {
-        uint256 epochLength;
-        uint256 floorWad;
-        uint256 horizon;
-        uint256 unlockedAtZeroWad;
-        uint256 polShareWad;
-        uint256 lockTerm;
-        uint256 lockExitWad;
-        bool lockSkipsRamp;
+    constructor(uint256 epochLength_, HallConfig memory c) {
+        if (epochLength_ == 0) revert BadConfig();
+        epochLength = epochLength_;
+        startTime = block.timestamp;
+        _setHallConfig(c);
     }
 
-    constructor(HallConfig memory c) {
+    function hallConfig() external view returns (HallConfig memory) {
+        return _hallConfig;
+    }
+
+    function _setHallConfig(HallConfig memory c) internal {
         if (
-            c.epochLength == 0 || c.horizon == 0 || c.floorWad > WAD || c.unlockedAtZeroWad > WAD || c.polShareWad > WAD
-                || c.lockExitWad > WAD || c.horizon > MAX_EPOCHS || c.lockTerm > MAX_EPOCHS
+            c.horizon == 0 || c.horizon > MAX_EPOCHS || c.lockTerm > MAX_EPOCHS || c.floorWad > WAD
+                || c.unlockedAtZeroWad > WAD || c.polShareWad > WAD || c.lockExitWad > WAD || c.lockMeltFloorWad > WAD
+                || c.tollPolShareWad > WAD
         ) revert BadConfig();
-        epochLength = c.epochLength;
-        startTime = block.timestamp;
-        floorWad = c.floorWad;
-        horizon = c.horizon;
-        unlockedAtZeroWad = c.unlockedAtZeroWad;
-        polShareWad = c.polShareWad;
-        lockTerm = c.lockTerm;
-        lockExitWad = c.lockExitWad;
-        lockSkipsRamp = c.lockSkipsRamp;
+        _hallConfig = c;
+        emit HallConfigSet(c);
     }
 
     // ------------------------------------------------------------------
@@ -213,14 +231,14 @@ abstract contract EpochHall {
         return _weight(_positions[id], epoch);
     }
 
-    /// Fees a position could collect now, as of the hall's current epoch.
+    /// What a position could collect now, as of the hall's current epoch.
     function unlockedOf(uint256 id) external view returns (uint256[2] memory out) {
         Position storage p = _positions[id];
         if (p.owner == address(0)) return out;
         uint256 fraction = _unlockedFraction(p);
         for (uint256 k; k < TOKENS; ++k) {
             uint256 earned = p.earned[k] + _span(p, p.settledTo, epoch, k);
-            out[k] = earned * fraction / WAD - p.paid[k];
+            out[k] = earned * fraction / WAD - p.paid[k] + p.tollOwed[k] + _tollSince(p, k);
         }
     }
 
@@ -231,7 +249,7 @@ abstract contract EpochHall {
 
     function _age(Position storage p, uint64 at) internal view returns (uint256) {
         uint256 age = uint256(int256(uint256(at)) - int256(p.start));
-        return age < horizon ? age : horizon;
+        return age < p.horizon ? age : p.horizon;
     }
 
     function _weight(Position storage p, uint64 at) internal view returns (uint256) {
@@ -239,13 +257,20 @@ abstract contract EpochHall {
     }
 
     function _unlockedFraction(Position storage p) internal view returns (uint256) {
-        return unlockedAtZeroWad + (WAD - unlockedAtZeroWad) * _age(p, epoch) / horizon;
+        return uint256(p.unlockedAtZeroWad) + (WAD - p.unlockedAtZeroWad) * _age(p, epoch) / p.horizon;
     }
 
     function _toll(Position storage p) internal view returns (uint256) {
         if (p.tier != HARD || epoch >= p.lockEnd) return 0;
-        // Melts in a straight line to zero at the end of the term (spec §18.3).
-        return uint256(p.shares) * p.tollWad / WAD * (p.lockEnd - epoch) / lockTerm;
+        // Melts in a straight line over the term, down to the floor the position opened with.
+        uint256 left = uint256(p.lockEnd - epoch) * WAD / p.lockTerm;
+        if (left < p.meltFloorWad) left = p.meltFloorWad;
+        return uint256(p.shares) * p.tollWad / WAD * left / WAD;
+    }
+
+    function _tollSince(Position storage p, uint256 k) internal view returns (uint256) {
+        if (p.tier != HARD) return 0;
+        return uint256(p.shares) * (_tollPerLockedShare[k] - p.tollMark[k]) / WAD;
     }
 
     /// The running sums as they stood before epoch `e`.
@@ -265,7 +290,7 @@ abstract contract EpochHall {
     /// What a position earned over epochs [from, to).
     function _span(Position storage p, uint64 from, uint64 to, uint256 token) internal view returns (uint256) {
         if (to <= from) return 0;
-        int256 matures = int256(p.start) + int256(horizon);
+        int256 matures = int256(p.start) + int256(uint256(p.horizon));
         uint256 scaled;
 
         // Still ramping: weight = base + perEpoch * (epoch - start).
@@ -284,7 +309,7 @@ abstract contract EpochHall {
         if (to > flatStart) {
             (uint256 a0,) = _sumsBefore(flatStart, token);
             (uint256 a1,) = _sumsBefore(to, token);
-            scaled += (uint256(p.baseWeight) + uint256(p.weightPerEpoch) * horizon) * (a1 - a0);
+            scaled += (uint256(p.baseWeight) + uint256(p.weightPerEpoch) * p.horizon) * (a1 - a0);
         }
         return scaled / WAD;
     }
@@ -295,9 +320,13 @@ abstract contract EpochHall {
 
     function _settle(Position storage p) internal {
         uint64 e = epoch;
-        if (p.settledTo == e) return;
+        bool hard = p.tier == HARD;
         for (uint256 k; k < TOKENS; ++k) {
-            p.earned[k] += _span(p, p.settledTo, e, k);
+            if (p.settledTo != e) p.earned[k] += _span(p, p.settledTo, e, k);
+            if (hard) {
+                p.tollOwed[k] += _tollSince(p, k);
+                p.tollMark[k] = _tollPerLockedShare[k];
+            }
         }
         p.settledTo = e;
     }
@@ -305,7 +334,7 @@ abstract contract EpochHall {
     function _addWeight(Position storage p) internal {
         uint64 e = epoch;
         totalWeight += _weight(p, e);
-        int256 matures = int256(p.start) + int256(horizon);
+        int256 matures = int256(p.start) + int256(uint256(p.horizon));
         if (matures > int256(uint256(e)) && p.weightPerEpoch != 0) {
             slope += p.weightPerEpoch;
             slopeEnding[uint256(matures)] += p.weightPerEpoch;
@@ -315,16 +344,17 @@ abstract contract EpochHall {
     function _removeWeight(Position storage p) internal {
         uint64 e = epoch;
         totalWeight -= _weight(p, e);
-        int256 matures = int256(p.start) + int256(horizon);
+        int256 matures = int256(p.start) + int256(uint256(p.horizon));
         if (matures > int256(uint256(e)) && p.weightPerEpoch != 0) {
             slope -= p.weightPerEpoch;
             slopeEnding[uint256(matures)] -= p.weightPerEpoch;
         }
     }
 
-    /// Open a position. The books must be current.
+    /// Open a position under today's settings. The books must be current.
     function _open(address owner, uint256 shares, uint8 tier) internal returns (uint256 id) {
-        if (tier > HARD || (tier == HARD && lockTerm == 0)) revert TierUnavailable();
+        HallConfig memory c = _hallConfig;
+        if (tier > HARD || (tier == HARD && c.lockTerm == 0)) revert TierUnavailable();
         if (shares > type(uint128).max) revert BadConfig();
         id = nextPositionId++;
         Position storage p = _positions[id];
@@ -333,33 +363,39 @@ abstract contract EpochHall {
         p.tier = tier;
         p.shares = uint128(shares);
         p.settledTo = e;
+        p.horizon = uint32(c.horizon);
+        p.unlockedAtZeroWad = uint64(c.unlockedAtZeroWad);
         // The weight a position reaches is base + perEpoch * horizon, which can
         // fall a few wei short of its shares. Rounding is always against the position.
-        uint256 base = shares * floorWad / WAD;
+        uint256 base = shares * c.floorWad / WAD;
         p.baseWeight = uint128(base);
-        p.weightPerEpoch = uint128((shares - base) / horizon);
+        p.weightPerEpoch = uint128((shares - base) / c.horizon);
         p.start = int64(uint64(e));
         if (tier == HARD) {
-            p.lockEnd = e + uint64(lockTerm);
-            p.tollWad = uint64(lockExitWad);
-            if (lockSkipsRamp) p.start = int64(uint64(e)) - int64(uint64(horizon));
+            p.lockEnd = e + uint64(c.lockTerm);
+            p.lockTerm = uint32(c.lockTerm);
+            p.tollWad = uint64(c.lockExitWad);
+            p.meltFloorWad = uint64(c.lockMeltFloorWad);
+            if (c.lockSkipsRamp) p.start = int64(uint64(e)) - int64(uint64(c.horizon));
+            p.tollMark = _tollPerLockedShare;
+            lockedShares += shares;
         }
         _addWeight(p);
         emit Opened(id, owner, shares, tier);
     }
 
-    /// Pay a position's unlocked fees to its owner.
+    /// Pay a position's unlocked fees, and its share of lockers' tolls, to its owner.
     function _collect(uint256 id) internal returns (uint256[2] memory out) {
         Position storage p = _positions[id];
         if (p.owner == address(0)) revert NoSuchPosition();
         _settle(p);
         uint256 fraction = _unlockedFraction(p);
         for (uint256 k; k < TOKENS; ++k) {
-            out[k] = p.earned[k] * fraction / WAD - p.paid[k];
-            if (out[k] != 0) {
-                p.paid[k] += out[k];
-                _payFee(k, p.owner, out[k]);
-            }
+            uint256 fees = p.earned[k] * fraction / WAD - p.paid[k];
+            p.paid[k] += fees;
+            out[k] = fees + p.tollOwed[k];
+            p.tollOwed[k] = 0;
+            if (out[k] != 0) _payFee(k, p.owner, out[k]);
         }
         emit Paid(id, p.owner, out[0], out[1]);
     }
@@ -376,8 +412,10 @@ abstract contract EpochHall {
         shares = p.shares;
         tollShares = waived ? 0 : _toll(p);
         _removeWeight(p); // before forfeits are added, so the leaver gets none of them
+        if (p.tier == HARD) lockedShares -= shares; // and none of its own toll
 
         uint256[2] memory lost;
+        uint256 polShare = _hallConfig.polShareWad;
         for (uint256 k; k < TOKENS; ++k) {
             uint256 held = p.earned[k] - p.paid[k];
             if (held == 0) continue;
@@ -385,7 +423,7 @@ abstract contract EpochHall {
                 _payFee(k, owner, held);
             } else {
                 lost[k] = held;
-                uint256 toPol = held * polShareWad / WAD;
+                uint256 toPol = held * polShare / WAD;
                 if (toPol != 0) _creditPol(k, toPol);
                 pending[k] += held - toPol;
             }
@@ -395,8 +433,17 @@ abstract contract EpochHall {
         delete _positions[id];
     }
 
-    /// Hand a position to someone else. Its age, its lock and the fees it
-    /// holds travel with it (spec §18.9).
+    /// Share `amount` of fee token `k` among locked positions, by size. Returns
+    /// false, and does nothing, when nobody is locked.
+    function _payLockers(uint256 k, uint256 amount) internal returns (bool) {
+        uint256 locked = lockedShares;
+        if (locked == 0 || amount == 0) return false;
+        _tollPerLockedShare[k] += amount * WAD / locked;
+        return true;
+    }
+
+    /// Hand a position to someone else. Its age, its lock and what it holds
+    /// travel with it (spec §18.9).
     function transferPosition(uint256 id, address to) external {
         Position storage p = _positions[id];
         if (p.owner != msg.sender) revert NotOwner();
@@ -407,30 +454,38 @@ abstract contract EpochHall {
         emit Moved(id, msg.sender, to);
     }
 
-    /// Merge two mature, unlocked-for-exit positions of the same owner (spec §18.9).
+    /// Merge two of the caller's positions that are both fully seasoned and
+    /// past any lock (spec §18.9). The result is an unlocked, mature position.
     function merge(uint256 a, uint256 b) external returns (uint256 id) {
         _current();
         Position storage pa = _positions[a];
         Position storage pb = _positions[b];
         if (pa.owner != msg.sender || pb.owner != msg.sender || a == b) revert NotOwner();
         uint64 e = epoch;
-        if (_age(pa, e) < horizon || _age(pb, e) < horizon || e < pa.lockEnd || e < pb.lockEnd) revert NotMature();
+        if (_age(pa, e) < pa.horizon || _age(pb, e) < pb.horizon || e < pa.lockEnd || e < pb.lockEnd) {
+            revert NotMature();
+        }
         _settle(pa);
         _settle(pb);
+        if (pa.tier == HARD) lockedShares -= pa.shares;
+        if (pb.tier == HARD) lockedShares -= pb.shares;
 
         id = nextPositionId++;
         Position storage m = _positions[id];
         m.owner = msg.sender;
         m.tier = SOFT;
         m.settledTo = e;
-        m.start = int64(uint64(e)) - int64(uint64(horizon));
+        // Both are mature, so the merged position simply carries their combined
+        // full weight. Total weight and the slope do not change.
+        m.horizon = 1;
+        m.start = int64(uint64(e)) - 1;
+        m.unlockedAtZeroWad = uint64(WAD);
         m.shares = pa.shares + pb.shares;
-        // Both are mature, so total weight does not change and neither does the slope.
-        m.baseWeight = pa.baseWeight + pb.baseWeight;
-        m.weightPerEpoch = pa.weightPerEpoch + pb.weightPerEpoch;
+        m.baseWeight = uint128(_weight(pa, e) + _weight(pb, e));
         for (uint256 k; k < TOKENS; ++k) {
             m.earned[k] = pa.earned[k] + pb.earned[k];
             m.paid[k] = pa.paid[k] + pb.paid[k];
+            m.tollOwed[k] = pa.tollOwed[k] + pb.tollOwed[k];
         }
         delete _positions[a];
         delete _positions[b];

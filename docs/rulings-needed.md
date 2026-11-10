@@ -2,6 +2,8 @@
 
 Written 2026-11-10 by the external reviewer, from the simulator in `sim/`. Canon is spec v1.16; nothing here changes it until ruled.
 
+**Status, later on 2026-11-10.** Jess delegated these choices to the reviewer ("pick what you think is going to be the best based on your tests and research"), on the footing that everything stays configurable for now. The reviewer's recommendation on each ruling below is therefore the working default. The contracts carry them in `src/Defaults.sol`, and every one can be changed on a live pool. They are defaults, not locks, and the spec has not been updated.
+
 **How to read the numbers.** Every figure is the mean of 40 runs on the current simulator, in which the seasoned pool and the plain pool face identical LPs and identical market moves. The "plain pool" has no seasoning and no lock. All market inputs are placeholders, so the figures show which way a choice pushes and roughly how hard, not what a real pool will earn. Each ruling lists the command that reproduces it.
 
 **Corrections to what I reported earlier** are collected at the end. Two of them change a recommendation.

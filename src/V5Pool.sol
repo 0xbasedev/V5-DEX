@@ -12,10 +12,14 @@ import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 /// - Swap fees never enter the reserves. The LP share goes to the hall's fee
 ///   ledger and is paid by seasoned weight; the venue cut is set aside.
 /// - There is no fungible LP token. Joining opens a position in the hall.
+/// - The fee moves inside bounds, quickly downward and slowly upward.
+/// - The venue cut can set itself each week from the pool's own yield.
 /// - A guardian can pause joins and swaps. A pause never blocks an exit, and
 ///   during one every exit is free of forfeits and tolls.
-/// - Nothing here can be changed after deployment except the pause and a
-///   deposit cap that can only be raised.
+///
+/// Everything is a setting for now, held by the `configurer`. A change to the
+/// hall's settings reaches only positions opened afterwards. Handing the
+/// configurer role to the zero address freezes the settings for good.
 ///
 /// First cut, for shaping. Not audited. Known gaps are listed in src/README.md.
 contract V5Pool is EpochHall {
@@ -26,18 +30,46 @@ contract V5Pool is EpochHall {
     /// Weights, in WAD, summing to one.
     uint256 public immutable weight0;
     uint256 public immutable weight1;
-    /// Fee on the amount paid in (WAD), and the venue's share of that fee (WAD).
-    uint256 public immutable feeWad;
-    uint256 public immutable venueCutWad;
-    address public immutable venue;
-    address public immutable pol;
-    address public immutable guardian;
-    address public immutable capRaiser;
+
+    struct Roles {
+        address venue; // receives the venue cut
+        address pol; // receives protocol-owned liquidity credits
+        address guardian; // may pause and unpause
+        address capRaiser; // may raise the deposit cap
+        address configurer; // may change settings
+        address feeSetter; // may queue a fee change inside the bounds
+    }
+
+    struct FeePolicy {
+        /// Bounds on the swap fee (WAD of the amount paid in).
+        uint256 feeMinWad;
+        uint256 feeMaxWad;
+        /// How long a decrease and an increase wait before taking effect, in seconds.
+        uint256 feeDownDelay;
+        uint256 feeUpDelay;
+        /// The venue cut sets itself: each review it aims to take `cutOfExcessWad`
+        /// of whatever the pool's fees yield above `referenceAprWad`.
+        bool autoCut;
+        uint256 cutOfExcessWad;
+        uint256 referenceAprWad;
+        /// Bounds on the venue cut (WAD of the fee), the most it moves per review, and seconds between reviews.
+        uint256 cutMinWad;
+        uint256 cutMaxWad;
+        uint256 cutStepWad;
+        uint256 cutReview;
+        /// Share of the venue cut paid to locked LPs (WAD).
+        uint256 lockBudgetWad;
+    }
+
+    Roles internal _roles;
+    FeePolicy internal _feePolicy;
 
     /// A swap may bring in at most this share of the reserve it adds to.
     uint256 internal constant MAX_IN_RATIO = 0.3e18;
     /// Shares locked for good on the first join, so the pool can never be emptied to a rounding trap.
     uint256 internal constant DEAD_SHARES = 1000;
+    /// No fee policy may allow a fee above this.
+    uint256 internal constant FEE_CEILING = 0.1e18;
 
     uint256[2] public reserves;
     uint256 public totalShares;
@@ -45,6 +77,17 @@ contract V5Pool is EpochHall {
     uint256[2] public feesInHall;
     uint256[2] public venueOwed;
     uint256[2] public polOwed;
+
+    uint256 internal _feeWad;
+    /// A fee change waiting out its delay, and when it takes effect (0 = none).
+    uint256 public queuedFeeWad;
+    uint256 public queuedFeeAt;
+
+    /// The venue's share of each fee (WAD).
+    uint256 public venueCutWad;
+    uint256 public lastCutReview;
+    /// Gross fees since the last review, valued in token0.
+    uint256 public feeValueSinceReview;
 
     bool public paused;
     /// Most of token0 the reserves may hold. Raise-only.
@@ -57,6 +100,10 @@ contract V5Pool is EpochHall {
     event Swapped(address indexed sender, address indexed tokenIn, uint256 amountIn, uint256 amountOut, uint256 fee);
     event PauseSet(bool paused);
     event CapRaised(uint256 cap);
+    event FeeQueued(uint256 feeWad, uint256 effectiveAt);
+    event VenueCutSet(uint256 cutWad, uint256 grossAprWad);
+    event FeePolicySet(FeePolicy policy);
+    event ConfigurerSet(address configurer);
 
     error Paused();
     error Reentered();
@@ -70,31 +117,30 @@ contract V5Pool is EpochHall {
         address token0;
         address token1;
         uint256 weight0;
+        uint256 epochLength;
         uint256 feeWad;
         uint256 venueCutWad;
-        address venue;
-        address pol;
-        address guardian;
-        address capRaiser;
         uint256 depositCap;
     }
 
-    constructor(PoolConfig memory c, HallConfig memory h) EpochHall(h) {
+    constructor(PoolConfig memory c, Roles memory r, HallConfig memory h, FeePolicy memory f)
+        EpochHall(c.epochLength, h)
+    {
         if (
             c.token0 == c.token1 || c.token0 == address(0) || c.token1 == address(0) || c.weight0 == 0
-                || c.weight0 >= WAD || c.feeWad >= WAD / 10 || c.venueCutWad > WAD || c.venue == address(0)
-                || c.pol == address(0)
+                || c.weight0 >= WAD || r.venue == address(0) || r.pol == address(0)
         ) revert BadConfig();
         token0 = c.token0;
         token1 = c.token1;
         weight0 = c.weight0;
         weight1 = WAD - c.weight0;
-        feeWad = c.feeWad;
+        _roles = r;
+        _setFeePolicy(f);
+        if (c.feeWad < f.feeMinWad || c.feeWad > f.feeMaxWad) revert BadConfig();
+        if (c.venueCutWad < f.cutMinWad || c.venueCutWad > f.cutMaxWad) revert BadConfig();
+        _feeWad = c.feeWad;
         venueCutWad = c.venueCutWad;
-        venue = c.venue;
-        pol = c.pol;
-        guardian = c.guardian;
-        capRaiser = c.capRaiser;
+        lastCutReview = block.timestamp;
         depositCap = c.depositCap;
     }
 
@@ -103,6 +149,24 @@ contract V5Pool is EpochHall {
         _lock = 2;
         _;
         _lock = 1;
+    }
+
+    modifier only(address who) {
+        if (msg.sender != who || who == address(0)) revert NotAllowed();
+        _;
+    }
+
+    function roles() external view returns (Roles memory) {
+        return _roles;
+    }
+
+    function feePolicy() external view returns (FeePolicy memory) {
+        return _feePolicy;
+    }
+
+    /// The swap fee in force right now.
+    function feeWad() public view returns (uint256) {
+        return queuedFeeAt != 0 && block.timestamp >= queuedFeeAt ? queuedFeeWad : _feeWad;
     }
 
     // ------------------------------------------------------------------
@@ -161,8 +225,7 @@ contract V5Pool is EpochHall {
         uint256 total = totalShares;
         out0 = (shares - toll) * reserves[0] / total;
         out1 = (shares - toll) * reserves[1] / total;
-        // The toll's share of the reserves leaves with the position's shares:
-        // a share to protocol-owned liquidity, the rest to the LPs who stay.
+        // The toll's share of the reserves leaves with the position's shares.
         uint256 toll0 = toll * reserves[0] / total;
         uint256 toll1 = toll * reserves[1] / total;
         if (out0 < min0 || out1 < min1) revert TooLittle();
@@ -178,12 +241,15 @@ contract V5Pool is EpochHall {
         emit Left(id, to, out0, out1, toll0, toll1);
     }
 
+    /// A lock's exit toll: a share to protocol-owned liquidity, the rest to the
+    /// LPs still locked. If nobody is locked it goes to every LP by weight.
     function _shareOutToll(uint256 k, uint256 amount) private {
         if (amount == 0) return;
-        uint256 toPol = amount * polShareWad / WAD;
+        uint256 toPol = amount * _hallConfig.tollPolShareWad / WAD;
         polOwed[k] += toPol;
-        pending[k] += amount - toPol;
-        feesInHall[k] += amount - toPol;
+        uint256 rest = amount - toPol;
+        if (!_payLockers(k, rest)) pending[k] += rest;
+        feesInHall[k] += rest;
     }
 
     /// Collect a position's unlocked fees.
@@ -209,23 +275,39 @@ contract V5Pool is EpochHall {
     {
         if (paused) revert Paused();
         _current();
+        _reviewCutIfDue();
         uint256 i = _index(tokenIn);
         uint256 o = 1 - i;
         uint256 fee;
         (amountOut, fee) = _quote(i, amountIn);
         if (amountOut == 0 || amountOut < minOut) revert TooLittle();
 
-        // The fee never touches the reserves.
-        uint256 toVenue = fee * venueCutWad / WAD;
-        venueOwed[i] += toVenue;
-        pending[i] += fee - toVenue;
-        feesInHall[i] += fee - toVenue;
+        _takeFee(i, fee);
         reserves[i] += amountIn - fee;
         reserves[o] -= amountOut;
 
         SafeTransferLib.safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
         SafeTransferLib.safeTransfer(o == 0 ? token0 : token1, to, amountOut);
         emit Swapped(msg.sender, tokenIn, amountIn, amountOut, fee);
+    }
+
+    /// Split a fee. It never touches the reserves.
+    function _takeFee(uint256 i, uint256 fee) private {
+        // Remember what the pool has earned, in token0, for the next review of the cut.
+        feeValueSinceReview += i == 0 ? fee : fee.mulDiv(reserves[0] * weight1, reserves[1] * weight0);
+
+        uint256 toVenue = fee * venueCutWad / WAD;
+        uint256 toLockers = toVenue * _feePolicy.lockBudgetWad / WAD;
+        uint256 toLps = fee - toVenue;
+        if (toLockers != 0) {
+            // Paid to locked LPs if there are any; otherwise to every LP.
+            if (!_payLockers(i, toLockers)) toLps += toLockers;
+            else feesInHall[i] += toLockers;
+            toVenue -= toLockers;
+        }
+        venueOwed[i] += toVenue;
+        pending[i] += toLps;
+        feesInHall[i] += toLps;
     }
 
     function _index(address token) private view returns (uint256) {
@@ -235,7 +317,7 @@ contract V5Pool is EpochHall {
     }
 
     function _quote(uint256 i, uint256 amountIn) private view returns (uint256 amountOut, uint256 fee) {
-        fee = amountIn.mulWadUp(feeWad);
+        fee = amountIn.mulWadUp(feeWad());
         uint256 net = amountIn - fee;
         uint256 rIn = reserves[i];
         uint256 rOut = reserves[1 - i];
@@ -250,6 +332,57 @@ contract V5Pool is EpochHall {
             power += power / 1e14 + 1; // more than the power function's error
             amountOut = power >= WAD ? 0 : rOut.mulWad(WAD - power);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The fee
+    // ------------------------------------------------------------------
+
+    /// Ask for a new swap fee, inside the bounds. A decrease takes effect after
+    /// the short delay and an increase after the long one.
+    function queueFee(uint256 newFeeWad) external only(_roles.feeSetter) {
+        FeePolicy memory f = _feePolicy;
+        if (newFeeWad < f.feeMinWad || newFeeWad > f.feeMaxWad) revert BadConfig();
+        uint256 current = feeWad();
+        _feeWad = current; // a change that had already matured is now simply the fee
+        queuedFeeWad = newFeeWad;
+        queuedFeeAt = block.timestamp + (newFeeWad < current ? f.feeDownDelay : f.feeUpDelay);
+        emit FeeQueued(newFeeWad, queuedFeeAt);
+    }
+
+    // ------------------------------------------------------------------
+    // The venue cut
+    // ------------------------------------------------------------------
+
+    /// Review the venue cut if a review is due. Anyone may call; swaps do it themselves.
+    function reviewCut() external {
+        _reviewCutIfDue();
+    }
+
+    function _reviewCutIfDue() private {
+        FeePolicy memory f = _feePolicy;
+        uint256 elapsed = block.timestamp - lastCutReview;
+        if (!f.autoCut || elapsed < f.cutReview || reserves[0] == 0) return;
+
+        // What the pool's fees yielded on its own depth since the last review,
+        // as a yearly rate. Both sides are valued in token0.
+        uint256 poolValue = reserves[0].divWad(weight0);
+        uint256 grossApr = feeValueSinceReview.mulDiv(365 days * WAD, elapsed * poolValue);
+
+        // Take a set share of the yield above the reference rate, none of the yield below it.
+        uint256 want =
+            grossApr > f.referenceAprWad ? f.cutOfExcessWad.mulDiv(grossApr - f.referenceAprWad, grossApr) : 0;
+        if (want < f.cutMinWad) want = f.cutMinWad;
+        if (want > f.cutMaxWad) want = f.cutMaxWad;
+
+        uint256 cut = venueCutWad;
+        if (want > cut) cut = want - cut > f.cutStepWad ? cut + f.cutStepWad : want;
+        else cut = cut - want > f.cutStepWad ? cut - f.cutStepWad : want;
+
+        venueCutWad = cut;
+        lastCutReview = block.timestamp;
+        feeValueSinceReview = 0;
+        emit VenueCutSet(cut, grossApr);
     }
 
     // ------------------------------------------------------------------
@@ -270,7 +403,7 @@ contract V5Pool is EpochHall {
     // Venue, guardian, cap
     // ------------------------------------------------------------------
 
-    /// Send the venue and protocol-owned-liquidity balances to their fixed addresses. Anyone may call.
+    /// Send the venue and protocol-owned-liquidity balances to their addresses. Anyone may call.
     function sweep() external guarded {
         for (uint256 k; k < TOKENS; ++k) {
             address token = k == 0 ? token0 : token1;
@@ -278,21 +411,63 @@ contract V5Pool is EpochHall {
             uint256 p = polOwed[k];
             venueOwed[k] = 0;
             polOwed[k] = 0;
-            if (v != 0) SafeTransferLib.safeTransfer(token, venue, v);
-            if (p != 0) SafeTransferLib.safeTransfer(token, pol, p);
+            if (v != 0) SafeTransferLib.safeTransfer(token, _roles.venue, v);
+            if (p != 0) SafeTransferLib.safeTransfer(token, _roles.pol, p);
         }
     }
 
     /// Stop or restart joins and swaps. Exits always work, and are free while paused.
-    function setPaused(bool on) external {
-        if (msg.sender != guardian) revert NotAllowed();
+    function setPaused(bool on) external only(_roles.guardian) {
         paused = on;
         emit PauseSet(on);
     }
 
-    function raiseCap(uint256 cap) external {
-        if (msg.sender != capRaiser || cap <= depositCap) revert NotAllowed();
+    function raiseCap(uint256 cap) external only(_roles.capRaiser) {
+        if (cap <= depositCap) revert NotAllowed();
         depositCap = cap;
         emit CapRaised(cap);
+    }
+
+    // ------------------------------------------------------------------
+    // Settings
+    // ------------------------------------------------------------------
+
+    /// Change the hall's settings. Positions already open keep the terms they opened under.
+    function setHallConfig(HallConfig calldata c) external only(_roles.configurer) {
+        _setHallConfig(c);
+    }
+
+    /// Change the fee policy. The fee and the cut in force are pulled inside the new bounds.
+    function setFeePolicy(FeePolicy calldata f) external only(_roles.configurer) {
+        _feeWad = feeWad();
+        queuedFeeAt = 0;
+        _setFeePolicy(f);
+        if (_feeWad < f.feeMinWad) _feeWad = f.feeMinWad;
+        if (_feeWad > f.feeMaxWad) _feeWad = f.feeMaxWad;
+        if (venueCutWad < f.cutMinWad) venueCutWad = f.cutMinWad;
+        if (venueCutWad > f.cutMaxWad) venueCutWad = f.cutMaxWad;
+    }
+
+    /// Set the venue cut by hand, inside its bounds. Only while it is not setting itself.
+    function setVenueCut(uint256 cutWad) external only(_roles.configurer) {
+        FeePolicy memory f = _feePolicy;
+        if (f.autoCut || cutWad < f.cutMinWad || cutWad > f.cutMaxWad) revert BadConfig();
+        venueCutWad = cutWad;
+        emit VenueCutSet(cutWad, 0);
+    }
+
+    function setRoles(Roles calldata r) external only(_roles.configurer) {
+        if (r.venue == address(0) || r.pol == address(0)) revert BadConfig();
+        _roles = r;
+        emit ConfigurerSet(r.configurer);
+    }
+
+    function _setFeePolicy(FeePolicy memory f) private {
+        if (
+            f.feeMinWad > f.feeMaxWad || f.feeMaxWad > FEE_CEILING || f.cutMinWad > f.cutMaxWad || f.cutMaxWad > WAD
+                || f.cutOfExcessWad > WAD || f.lockBudgetWad > WAD || (f.autoCut && f.cutReview == 0)
+        ) revert BadConfig();
+        _feePolicy = f;
+        emit FeePolicySet(f);
     }
 }

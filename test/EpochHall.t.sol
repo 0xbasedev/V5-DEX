@@ -10,7 +10,15 @@ contract HallHarness is EpochHall {
     uint256[2] public polGot;
     uint256[2] public feesIn;
 
-    constructor(HallConfig memory c) EpochHall(c) {}
+    constructor(HallConfig memory c) EpochHall(6 hours, c) {}
+
+    function setHallConfig(HallConfig memory c) external {
+        _setHallConfig(c);
+    }
+
+    function payLockers(uint256 k, uint256 amount) external returns (bool) {
+        return _payLockers(k, amount);
+    }
 
     function _payFee(uint256 k, address to, uint256 amount) internal override {
         paidTo[to][k] += amount;
@@ -59,6 +67,18 @@ contract EpochHallTest is Base {
         hall = _hall(0.5e18, 4, 0.5e18, 0.25e18, 0, 0, false);
     }
 
+    function _config(
+        uint256 floor,
+        uint256 horizon,
+        uint256 u0,
+        uint256 polShare,
+        uint256 term,
+        uint256 exitWad,
+        bool skip
+    ) internal pure returns (EpochHall.HallConfig memory) {
+        return EpochHall.HallConfig(floor, horizon, u0, polShare, term, exitWad, 0, skip, 0);
+    }
+
     function _hall(
         uint256 floor,
         uint256 horizon,
@@ -68,7 +88,7 @@ contract EpochHallTest is Base {
         uint256 exitWad,
         bool skip
     ) internal returns (HallHarness) {
-        return new HallHarness(EpochHall.HallConfig(EPOCH, floor, horizon, u0, polShare, term, exitWad, skip));
+        return new HallHarness(_config(floor, horizon, u0, polShare, term, exitWad, skip));
     }
 
     function _nextEpoch() internal {
@@ -192,6 +212,57 @@ contract EpochHallTest is Base {
         h.poke(type(uint256).max);
         vm.assertEq(h.weightOf(locked), 100e18, "never more than a seasoned position");
         vm.assertEq(h.weightOf(soft), 100e18, "which the other becomes");
+    }
+
+    function test_aTollThatNeverMeltsIsFlatUntilTheLockEnds() public {
+        EpochHall.HallConfig memory c = _config(0.5e18, 4, 0.5e18, 0.25e18, 10, 0.1e18, false);
+        c.lockMeltFloorWad = 1e18;
+        HallHarness h = new HallHarness(c);
+        uint256 id = h.open(alice, 100e18, 1);
+        for (uint256 i; i < 9; ++i) {
+            _nextEpoch();
+        }
+        h.poke(type(uint256).max);
+        vm.assertEq(h.tollOf(id), 10e18, "still the full cost on the last day");
+        _nextEpoch();
+        h.poke(type(uint256).max);
+        vm.assertEq(h.tollOf(id), 0, "and nothing once the lock has ended");
+    }
+
+    function test_aChangeOfSettingsReachesOnlyNewPositions() public {
+        HallHarness h = _hall(0.5e18, 4, 0.5e18, 0.25e18, 10, 0.1e18, false);
+        uint256 old = h.open(alice, 100e18, 1);
+        // Everything gets harsher: a higher exit cost that never melts, a longer lock, a lower floor, a full hold.
+        EpochHall.HallConfig memory c = _config(0.1e18, 8, 0, 0.25e18, 40, 0.5e18, false);
+        c.lockMeltFloorWad = 1e18;
+        h.setHallConfig(c);
+        uint256 fresh = h.open(bob, 100e18, 1);
+
+        vm.assertEq(h.tollOf(old), 10e18, "the open position keeps the cost it was opened with");
+        vm.assertEq(h.weightOf(old), 50e18, "and its floor");
+        vm.assertEq(h.positionOf(old).lockEnd, 10, "and its term");
+        vm.assertEq(h.tollOf(fresh), 50e18, "the new one gets the new terms");
+        vm.assertEq(h.weightOf(fresh), 10e18, "all of them");
+        for (uint256 i; i < 10; ++i) {
+            _nextEpoch();
+        }
+        h.poke(type(uint256).max);
+        vm.assertEq(h.tollOf(old), 0, "and the old one is free on its original date");
+        vm.assertEq(h.weightOf(old), 100e18, "fully seasoned on its original horizon");
+    }
+
+    function test_tollsPaidToLockersGoBySizeAndOnlyToThoseLockedBefore() public {
+        HallHarness h = _hall(0.5e18, 4, 0.5e18, 0.25e18, 10, 0.1e18, false);
+        vm.assertTrue(!h.payLockers(0, 5e18), "with nobody locked there is no one to pay");
+        uint256 big = h.open(alice, 300e18, 1);
+        uint256 small = h.open(bob, 100e18, 1);
+        h.open(address(0xCAFE), 500e18, 0);
+        vm.assertTrue(h.payLockers(0, 40e18), "now there is");
+        uint256 late = h.open(address(0xD00D), 400e18, 1);
+
+        vm.assertEq(h.collect(big)[0], 30e18, "three quarters to the larger lock");
+        vm.assertEq(h.collect(small)[0], 10e18, "a quarter to the smaller");
+        vm.assertEq(h.collect(late)[0], 0, "nothing to the one who locked afterwards");
     }
 
     function test_hardTierUnavailableWhenSwitchedOff() public {

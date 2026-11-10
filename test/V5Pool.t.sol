@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Base, Token} from "./Base.sol";
 import {V5Pool} from "../src/V5Pool.sol";
 import {EpochHall} from "../src/EpochHall.sol";
+import {Defaults} from "../src/Defaults.sol";
 
 abstract contract PoolSetup is Base {
     uint256 constant EPOCH = 6 hours;
@@ -17,11 +18,35 @@ abstract contract PoolSetup is Base {
     address bob = address(0xB0B);
     address trader = address(0x7DE);
 
-    function _pool(uint256 weight0, uint256 cap) internal returns (V5Pool p) {
-        p = new V5Pool(
-            V5Pool.PoolConfig(address(a), address(b), weight0, 0.003e18, 0.1e18, venue, pol, guardian, capRaiser, cap),
-            // floor 1/2, horizon 4 epochs, half unlocked at once, 1/4 of forfeits to POL, 10-epoch lock at 10%
-            EpochHall.HallConfig(EPOCH, 0.5e18, 4, 0.5e18, 0.25e18, 10, 0.1e18, false)
+    address configurer = address(0xC0F);
+    address feeSetter = address(0xFEE5);
+
+    /// floor 1/2, horizon 4 epochs, half unlocked at once, 1/4 of forfeits and tolls to POL, 10-epoch lock at 10%.
+    function _hallConfig() internal pure returns (EpochHall.HallConfig memory) {
+        return EpochHall.HallConfig(0.5e18, 4, 0.5e18, 0.25e18, 10, 0.1e18, 0, false, 0.25e18);
+    }
+
+    /// A fee between 0.1% and 0.3%, a flat venue cut, nothing to lockers.
+    function _feePolicy() internal pure returns (V5Pool.FeePolicy memory) {
+        return V5Pool.FeePolicy(
+            0.001e18, 0.003e18, 1 days, 14 days, false, 0.5e18, 0.06e18, 0.05e18, 0.4e18, 0.05e18, 7 days, 0
+        );
+    }
+
+    function _roles() internal view returns (V5Pool.Roles memory) {
+        return V5Pool.Roles(venue, pol, guardian, capRaiser, configurer, feeSetter);
+    }
+
+    function _pool(uint256 weight0, uint256 cap) internal returns (V5Pool) {
+        return _pool(weight0, cap, _hallConfig(), _feePolicy());
+    }
+
+    function _pool(uint256 weight0, uint256 cap, EpochHall.HallConfig memory h, V5Pool.FeePolicy memory f)
+        internal
+        returns (V5Pool)
+    {
+        return new V5Pool(
+            V5Pool.PoolConfig(address(a), address(b), weight0, EPOCH, 0.003e18, 0.1e18, cap), _roles(), h, f
         );
     }
 
@@ -243,6 +268,156 @@ contract V5PoolTest is PoolSetup {
         uint256 out = p.quote(address(a), 1e18);
         vm.assertApproxEqAbs(out, 0.997e18, 0.0001e18, "close to spot less the fee");
         vm.assertLt(out, 0.997e18, "and never better than it");
+    }
+}
+
+contract V5PoolSettingsTest is PoolSetup {
+    function setUp() public {
+        a = new Token("A");
+        b = new Token("B");
+    }
+
+    function _ready(V5Pool p) internal returns (V5Pool) {
+        _fund(alice, p);
+        _fund(bob, p);
+        _fund(trader, p);
+        return p;
+    }
+
+    function _join(V5Pool p, address who, uint256 amount, uint8 tier) internal returns (uint256 id) {
+        vm.prank(who);
+        (id,) = p.join(amount, amount, 0, tier, who);
+    }
+
+    function test_aPoolOpensOnTheDefaults() public {
+        V5Pool p = _ready(
+            new V5Pool(
+                V5Pool.PoolConfig(
+                    address(a), address(b), 0.5e18, Defaults.EPOCH, 0.003e18, Defaults.OPENING_CUT, type(uint256).max
+                ),
+                _roles(),
+                Defaults.hall(),
+                Defaults.fees(0.003e18, 0.06e18)
+            )
+        );
+        uint256 soft = _join(p, alice, 1000e18, 0);
+        uint256 locked = _join(p, bob, 1000e18, 1);
+        vm.assertApproxEqAbs(p.weightOf(soft), 400e18, 1e6, "an unlocked position starts at the floor");
+        vm.assertApproxEqAbs(p.weightOf(locked), 1000e18, 1e6, "a locked one skips the ramp, with no boost beyond that");
+        vm.assertEq(p.tollOf(locked), 100e18, "and would pay 10% to leave today");
+        vm.assertEq(p.feeWad(), 0.003e18, "the fee it was opened with");
+        vm.assertEq(p.feePolicy().feeMinWad, 0.0012e18, "which may fall to 0.4 of that");
+        vm.prank(trader);
+        p.swap(address(a), 10e18, 0, trader);
+    }
+
+    function test_aLeaversTollGoesToThoseStillLocked() public {
+        EpochHall.HallConfig memory h = _hallConfig();
+        h.tollPolShareWad = 0;
+        V5Pool p = _ready(_pool(0.5e18, type(uint256).max, h, _feePolicy()));
+        uint256 stays = _join(p, alice, 1000e18, 1);
+        uint256 leaves = _join(p, bob, 1000e18, 1);
+        _join(p, trader, 1000e18, 0);
+
+        vm.prank(bob);
+        p.exit(leaves, 0, 0, bob); // day one: the full 10%
+        vm.assertEq(p.polOwed(0), 0, "none of it to POL");
+        vm.prank(alice);
+        uint256[2] memory got = p.collect(stays);
+        vm.assertApproxEqAbs(got[0], 100e18, 1e6, "all of it to the LP still locked");
+        vm.assertApproxEqAbs(got[1], 100e18, 1e6, "in both tokens");
+    }
+
+    function test_theFeeFallsFastAndRisesSlowly() public {
+        V5Pool p = _ready(_pool(0.5e18, type(uint256).max));
+        vm.prank(alice);
+        vm.expectRevert(V5Pool.NotAllowed.selector);
+        p.queueFee(0.002e18);
+        vm.startPrank(feeSetter);
+        vm.expectRevert(EpochHall.BadConfig.selector);
+        p.queueFee(0.0005e18); // below the floor
+        vm.expectRevert(EpochHall.BadConfig.selector);
+        p.queueFee(0.004e18); // above the cap
+
+        p.queueFee(0.002e18);
+        vm.assertEq(p.feeWad(), 0.003e18, "not yet");
+        vm.warp(block.timestamp + 1 days);
+        vm.assertEq(p.feeWad(), 0.002e18, "a decrease lands in a day");
+
+        p.queueFee(0.003e18);
+        vm.warp(block.timestamp + 13 days);
+        vm.assertEq(p.feeWad(), 0.002e18, "an increase is still waiting after thirteen");
+        vm.warp(block.timestamp + 1 days);
+        vm.assertEq(p.feeWad(), 0.003e18, "and lands after fourteen");
+        vm.stopPrank();
+    }
+
+    function test_theVenueCutSetsItselfFromThePoolsYield() public {
+        V5Pool.FeePolicy memory f = _feePolicy();
+        f.autoCut = true;
+        V5Pool busy = _ready(_pool(0.5e18, type(uint256).max, _hallConfig(), f));
+        V5Pool quiet = _ready(_pool(0.5e18, type(uint256).max, _hallConfig(), f));
+        _join(busy, alice, 1000e18, 0);
+        _join(quiet, alice, 1000e18, 0);
+
+        // A week of heavy trading in one pool: fees worth far more than 6% a year on its depth.
+        vm.startPrank(trader);
+        for (uint256 i; i < 20; ++i) {
+            busy.swap(address(a), 50e18, 0, trader);
+            busy.swap(address(b), 50e18, 0, trader);
+        }
+        vm.stopPrank();
+        vm.warp(block.timestamp + 7 days);
+        busy.reviewCut();
+        quiet.reviewCut();
+        vm.assertEq(busy.venueCutWad(), 0.15e18, "the busy pool's cut steps up, one step at a time");
+        vm.assertEq(quiet.venueCutWad(), 0.05e18, "the quiet pool's steps down to its floor");
+
+        vm.warp(block.timestamp + 6 days);
+        busy.reviewCut();
+        vm.assertEq(busy.venueCutWad(), 0.15e18, "and nothing moves before the next review is due");
+    }
+
+    function test_aLockBudgetPaysLockersOutOfTheVenueCut() public {
+        V5Pool.FeePolicy memory f = _feePolicy();
+        f.lockBudgetWad = 0.5e18;
+        V5Pool p = _ready(_pool(0.5e18, type(uint256).max, _hallConfig(), f));
+        _join(p, alice, 1000e18, 0);
+        vm.prank(trader);
+        p.swap(address(a), 100e18, 0, trader);
+        vm.assertEq(p.venueOwed(0), 0.015e18, "with nobody locked the venue keeps its half and LPs get the rest");
+
+        uint256 locked = _join(p, bob, 1000e18, 1);
+        vm.prank(trader);
+        p.swap(address(a), 100e18, 0, trader);
+        vm.assertEq(p.venueOwed(0), 0.03e18, "the venue's half again");
+        vm.prank(bob);
+        vm.assertApproxEqAbs(p.collect(locked)[0], 0.015e18, 1e6, "and the other half to the locked LP at once");
+    }
+
+    function test_settingsCanBeChangedOnlyByTheConfigurerAndThenFrozen() public {
+        V5Pool p = _ready(_pool(0.5e18, type(uint256).max));
+        uint256 open = _join(p, alice, 1000e18, 1);
+        EpochHall.HallConfig memory h = _hallConfig();
+        h.lockExitWad = 0.5e18;
+
+        uint256 tollBefore = p.tollOf(open);
+        vm.prank(alice);
+        vm.expectRevert(V5Pool.NotAllowed.selector);
+        p.setHallConfig(h);
+        vm.startPrank(configurer);
+        p.setHallConfig(h);
+        vm.assertGt(tollBefore, 0, "there is a toll to compare");
+        vm.assertEq(p.tollOf(open), tollBefore, "no change can raise the toll on a position already open");
+        p.setVenueCut(0.2e18);
+        vm.assertEq(p.venueCutWad(), 0.2e18, "a flat cut can be set by hand");
+
+        V5Pool.Roles memory r = _roles();
+        r.configurer = address(0);
+        p.setRoles(r);
+        vm.expectRevert(V5Pool.NotAllowed.selector);
+        p.setHallConfig(h);
+        vm.stopPrank();
     }
 }
 
