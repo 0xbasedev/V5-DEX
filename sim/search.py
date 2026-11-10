@@ -54,9 +54,10 @@ ENVIRONMENTS = {
 }
 
 
-def environment(name):
+def environment(name, world=None):
+    """`world` holds assumptions about the market that apply in every environment."""
     scenario, extra = ENVIRONMENTS[name]
-    return Params().but(**SCENARIOS[scenario]).but(**extra)
+    return Params().but(**SCENARIOS[scenario]).but(**extra).but(**(world or {}))
 
 
 def venue_value(p, r):
@@ -67,8 +68,8 @@ def venue_value(p, r):
 
 def measure(job):
     """Run one design in one environment over several seeds."""
-    design, env_name, seeds, first_seed = job
-    base = environment(env_name)
+    design, env_name, seeds, first_seed, world = job
+    base = environment(env_name, world)
     if design is None:
         p = base.plain()
     elif design.get("_plain"):
@@ -80,7 +81,7 @@ def measure(job):
     kept = []
     for s in range(seeds):
         r = simulate(p.but(seed=first_seed + s))
-        tvl += r["tvl_avg"]
+        tvl += r["reliable_tvl_avg"]   # the same as tvl_avg unless recent arrivals are discounted
         value += venue_value(p, r)
         apr += r["net_apr_long"] if r["net_apr_long"] == r["net_apr_long"] else 0.0
         kept += [r[k] for k in ("shock_retained_pct", "shock2_retained_pct") if r[k] == r[k]]
@@ -105,8 +106,11 @@ def score(design, results, baseline):
                 lp_apr_points=sum(lp) / len(lp))
 
 
+WORLD = {}
+
+
 def evaluate(pool, designs, seeds, first_seed, baseline=None):
-    jobs = [(d, env, seeds, first_seed) for d in designs for env in ENVIRONMENTS]
+    jobs = [(d, env, seeds, first_seed, WORLD) for d in designs for env in ENVIRONMENTS]
     flat = pool.map(measure, jobs, chunksize=4)
     n = len(ENVIRONMENTS)
     grouped = [dict(zip(ENVIRONMENTS, flat[i * n:(i + 1) * n])) for i in range(len(designs))]
@@ -161,7 +165,11 @@ def main():
     ap.add_argument("--tolerance", type=float, default=3.0, help="depth a design may give up against the plain pool, %%")
     ap.add_argument("--finalists", type=int, default=12)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--fresh-value", type=float, default=1.0,
+                    help="what a dollar of liquidity under a week old is worth to traders, against one that stayed")
+    ap.add_argument("--out", default="sim/out/search.csv")
     args = ap.parse_args()
+    WORLD.update(fresh_depth_value=args.fresh_value)
     rng = random.Random(args.seed)
 
     with Pool() as pool:
@@ -186,7 +194,7 @@ def main():
             ok = run_batch(children, f"refining, round {i + 1}")
 
         os.makedirs("sim/out", exist_ok=True)
-        with open("sim/out/search.csv", "w", newline="") as fh:
+        with open(args.out, "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
@@ -228,7 +236,7 @@ def main():
             counts[r[k]] = counts.get(r[k], 0) + 1
         common = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
         print(f"  {k:22}" + "   ".join(f"{v:g}: {100 * c // len(top)}%" for v, c in common))
-    print("\nEvery candidate: sim/out/search.csv")
+    print(f"\nEvery candidate: {args.out}")
     print("Columns: revenue = venue's take against the plain pool; kept = extra points of liquidity left after a shock;")
     print("depth = worst case against the plain pool across environments; LP APR = long-stay net APR, points against plain.")
     print("'Seasoning alone' compares each finalist with the same pool, fee policy and venue cut but no seasoning or lock.")

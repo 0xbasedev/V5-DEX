@@ -19,6 +19,7 @@ from .model import Params, SCENARIOS, average
 ROWS = [
     ("Depth", None),
     ("tvl_avg", "Average TVL ($)"),
+    ("reliable_tvl_avg", "  counting recent arrivals at a discount ($)"),
     ("tvl_end", "TVL at the end ($)"),
     ("seasoned_share_pct", "TVL that is fully seasoned (%)"),
     ("volume", "Volume ($)"),

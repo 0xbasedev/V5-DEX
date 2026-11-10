@@ -101,6 +101,15 @@ class ModelChecks(unittest.TestCase):
         # melt floor 0 with no rolling is the old behaviour: same run, same result.
         self.assertEqual(repr(run(base.but(lock_melt_floor=0.0, lock_rolls=0))[0]), repr(plain))
 
+    def test_recent_arrivals_can_count_for_less(self):
+        full, _ = run(Params(days=90))
+        self.assertAlmostEqual(full["reliable_tvl_avg"], full["tvl_avg"])
+        half, _ = run(Params(days=90, fresh_depth_value=0.5))
+        self.assertLess(half["reliable_tvl_avg"], half["tvl_avg"])
+        # A plain pool lets hot money in, so discounting it costs the plain pool more flow.
+        loss = lambda p: 1 - run(p.but(fresh_depth_value=0.5))[0]["volume"] / run(p)[0]["volume"]
+        self.assertGreater(loss(Params(days=90).plain()), loss(Params(days=90)))
+
     def test_competitor_depth_follows_its_yield(self):
         fixed, _ = run(Params(days=120))
         self.assertEqual(fixed["rival_tvl_end"], Params().competitor_tvl)

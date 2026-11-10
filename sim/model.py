@@ -75,6 +75,9 @@ class Params:
     trade_sigma: float = 1.5
     depth_multiplier: float = 50         # how much deeper than 50/50 the curve trades; 1 for a volatile pair
     volume_sigma: float = 0.35           # per-epoch noise
+    fresh_depth_value: float = 1.0       # how much a dollar of newly arrived liquidity counts toward attracting
+                                         # trades, against a dollar that has been there a while. 1 = the same.
+    fresh_depth_days: float = 7          # how long liquidity has to stay before it counts in full
     anchor_tvl: float = 500_000          # anchor tenants, in from day one and never leaving
     annual_vol_pct: float = 0            # price volatility of the pair; 0 is a stable pair
     shock_day: int = -1                  # day of a market shock; -1 for none
@@ -241,7 +244,7 @@ def run(p: Params):
     accepted = {k: 0.0 for k in KINDS}
     late = [0.0, 0.0]   # long capital offered and accepted in the second half
     pol_cash = prize_pot = pol_seen = 0.0
-    seasoned_days, tvl_days, hard_days = [], [], []
+    seasoned_days, tvl_days, hard_days, reliable_days = [], [], [], []
     shock = {}   # what the pool looked like at each shock, and who stayed
     toll_events = []     # (epoch, dollars per locked share) for tolls paid to lockers
     toll_flow = [0.0, 0.0]   # tolls paid to lockers today, and their smoothed daily yield per locked dollar
@@ -250,6 +253,17 @@ def run(p: Params):
 
     def tvl():
         return shares * index()
+
+    fresh = [0.0]   # shares that arrived too recently to count in full
+    fresh_epochs = round(p.fresh_depth_days * E)
+
+    def count_fresh():
+        if p.fresh_depth_value < 1:
+            fresh[0] = sum(m["s"] for m in meta.values() if hall.e - m["e_in"] < fresh_epochs)
+
+    def reliable():
+        """Depth as traders and routers count it: recent arrivals are discounted."""
+        return (shares - (1 - p.fresh_depth_value) * fresh[0]) * index()
 
     def open_position(kind, size, stay, tier="soft", terms=1):
         nonlocal shares, locked_shares
@@ -422,14 +436,14 @@ def run(p: Params):
             pending = None
             fee_changes += 1
         if p.our_response and pending is None and day and day % p.our_review_days == 0:
-            want = our_reply(live, p.gross_fee_pct, tvl(), rival_fee, rival_tvl)
+            want = our_reply(live, p.gross_fee_pct, reliable(), rival_fee, rival_tvl)
             if abs(want - live.gross_fee_pct) > 1e-12:
                 wait = p.fee_down_delay_days if want < live.gross_fee_pct else p.fee_up_delay_days
                 pending = (day + wait, want)
         our_fee_days.append(live.gross_fee_pct)
         if (p.competitor_response and day >= p.competitor_delay_days
                 and (day - p.competitor_delay_days) % p.competitor_review_days == 0):
-            rival_fee = competitor_reply(live, tvl(), rival_fee, rival_tvl)
+            rival_fee = competitor_reply(live, reliable(), rival_fee, rival_tvl)
         rival_fee_days.append(rival_fee)
         rival_tvl_days.append(rival_tvl)
         if day == p.shock_day:
@@ -483,6 +497,7 @@ def run(p: Params):
             open_position("pol", pol_cash, None)
             pol_cash = 0.0
 
+        count_fresh()
         for _ in range(E):
             arb = 0.0
             if volatile:
@@ -492,7 +507,7 @@ def run(p: Params):
                 # than the fee are not worth arbitraging.
                 arb = max(0.0, abs(step) - live.gross_fee_pct / 100) * tvl() / 4
             noise = math.exp(rng.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
-            volume = organic_volume(tvl()) / E * noise + arb
+            volume = organic_volume(reliable()) / E * noise + arb
             gross = volume * live.gross_fee_pct / 100
             venue = gross * p.venue_cut_pct / 100
             to_lockers = venue * p.lock_budget_pct / 100
@@ -536,6 +551,8 @@ def run(p: Params):
         toll_flow[1] += (toll_flow[0] / locked_value if locked_value else 0.0) / 30 - toll_flow[1] / 30
         toll_flow[0] = 0.0
         tvl_days.append(tvl())
+        count_fresh()
+        reliable_days.append(reliable())
         hard_days.append(sum(m["s"] for m in meta.values() if m["tier"] == "hard") / shares)
         if hall.e >= H:
             seasoned_days.append(sum(m["s"] for m in meta.values() if hall.e - m["e_in"] >= H) / shares)
@@ -567,6 +584,7 @@ def run(p: Params):
     out["accepted_long_late_pct"] = 100 * late[1] / late[0] if late[0] else float("nan")
     out["tvl_end"] = tvl()
     out["tvl_avg"] = sum(tvl_days) / len(tvl_days)
+    out["reliable_tvl_avg"] = sum(reliable_days) / len(reliable_days)
     out["seasoned_share_pct"] = 100 * sum(seasoned_days) / len(seasoned_days) if seasoned_days else float("nan")
     out["hard_share_pct"] = 100 * sum(hard_days) / len(hard_days)
     for tag in ("shock", "shock2"):
