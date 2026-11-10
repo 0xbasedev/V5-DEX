@@ -126,7 +126,8 @@ contract V5PoolTest is PoolSetup {
     function test_lockTollNeverExceedsTheRateWrittenAtOpenAndGoesToStayers() public {
         _join(alice, 1000e18, 0);
         uint256 locked = _join(bob, 1000e18, 1);
-        for (uint256 i; // half way through a 10-epoch lock at 10% i < 5; ++i) {
+        // Half way through a 10-epoch lock at 10%.
+        for (uint256 i; i < 5; ++i) {
             _nextEpoch();
         }
 
