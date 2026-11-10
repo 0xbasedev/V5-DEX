@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {EpochHall} from "./EpochHall.sol";
 import {V5Pool} from "./V5Pool.sol";
+import {VenueSplitter} from "./VenueSplitter.sol";
 
 /// @title Defaults
 /// @notice The settings a new V5 pool starts with.
@@ -63,6 +64,26 @@ library Defaults {
         // Nothing from the venue cut goes to lockers at the start. Raising this
         // buys more liquidity through a shock at the venue's expense (ruling 1, option b).
         f.lockBudgetWad = 0;
+    }
+
+    /// How the venue cut is divided. The 40/20/10 lines for the build fund,
+    /// protocol-owned liquidity and prizes are the simulator's working values
+    /// and were never swept; the remaining 30% is the buyback line. Before the
+    /// token exists, half of that line goes back to the pool's LPs and half is
+    /// banked for the launch burn (ruled: 50/50).
+    function lines(address build, address pol, address prize, address bank)
+        internal
+        pure
+        returns (VenueSplitter.Lines memory l)
+    {
+        l.buildWad = 0.4e18;
+        l.polWad = 0.2e18;
+        l.prizeWad = 0.1e18;
+        l.buybackToLpsWad = 0.5e18;
+        l.build = build;
+        l.pol = pol;
+        l.prize = prize;
+        l.bank = bank;
     }
 
     /// The venue cut a pool opens with, before its first weekly review.

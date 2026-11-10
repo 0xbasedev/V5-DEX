@@ -14,7 +14,8 @@ pnpm test:sim         # the simulator's own tests
 |---|---|
 | `EpochHall.sol` | Seasoned-position bookkeeping: the weight ramp, constant-time fee settlement, the fee hold, forfeits on early exit, the hard lock and its toll, tolls paid to lockers, transfer and merge. A Solidity port of `sim/hall.py`. |
 | `V5Pool.sol` | A two-token weighted pool built on the hall. Swap fees go to the hall's ledger and to the venue, never into reserves. Joining opens a position; there is no LP token. The fee moves inside bounds, and the venue cut can set itself. |
-| `Defaults.sol` | The settings a new pool starts with, each with the reason for it. |
+| `VenueSplitter.sol` | Divides one pool's venue cut between the build fund, protocol-owned liquidity, prizes and the buyback line. Before the token exists, half the buyback line goes back to the pool's LPs and half is sent to a bank address. |
+| `Defaults.sol` | The settings a new pool and its splitter start with, each with the reason for it. |
 
 ## Everything is a setting
 
@@ -53,14 +54,18 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 | Fee delays | 1 day down, 14 days up | A fast decrease beat a slow one by 31% to 53% in venue revenue. |
 | Venue cut | Sets itself weekly, 5% to 40%, takes half the yield above the reference rate | Beat every flat cut it was compared with (ruling 4). |
 | Reference rate | Set per pool | No default is safe. Too low and the venue overcharges. |
+| Venue cut lines | 40% build, 20% POL, 10% prizes, 30% buyback | The simulator's working values; never swept. |
+| Buyback line before the token | Half back to LPs, half banked | Ruled 50/50. |
 
 ## What the tests cover
 
-34 tests in `test/`, no test library needed.
+40 tests in `test/`, no test library needed.
 
 - **Against brute force.** Random opens, exits, collections and fees over 30 epochs, 512 runs. A slow calculation that walks every position every epoch must agree with the hall, the hall may never pay out more than came in, and rounding may never favour a position.
 - **The simulator's named cases**, with the same numbers: the early-exit forfeit, a transfer inside the horizon, a merge.
 - **The pool**: the swap pays exactly the quote; fees never enter reserves; a weighted pool prices by its weights; a round trip always costs something.
+- **Compounding**: unlocked fees become liquidity at the position's current age, held fees cannot be used, and the position matures on its original date at its new size.
+- **The venue cut's lines**: each receives its share to the wei, the LPs' half comes back as fees, and the lines must add up.
 - **The settings**: a pool opens on the defaults; a change reaches only new positions; the fee falls in a day and rises in fourteen; the venue cut steps up in a busy pool and down in a quiet one; tolls and the lock budget reach lockers by size; settings can be frozen.
 - **The council's invariants that can be tested on-chain**: a leaver never pays more than the rate written into the position; a pause never blocks an exit and makes it free; no setting can raise a toll on an open position.
 - **Two invariants under random use**: every token the pool holds is accounted for to the wei, and every position can always leave.
@@ -82,8 +87,8 @@ These are about how the contracts are built, not what they are set to.
 
 ## Not built yet
 
-- Compounding, and the auto-compounding vault.
-- The banked half: escrow, deferred claims, sunset refund (spec §18.8).
+- The auto-compounding vault. Compounding itself is built, and uses only as much of each token as fits the pool's proportions; it does not swap the excess.
+- The banked half's escrow, its holding cap, deferred claims and sunset refund (spec §18.8). The splitter sends the banked share to an address and stops there.
 - A router, and per-transaction permits.
 - A timelock in front of the configurer, and anything that moves the fee automatically.
 - The depeg waiver, the tuning-fork fee and the stable-amplified curve.
@@ -94,4 +99,4 @@ These are about how the contracts are built, not what they are set to.
 
 From the tests: a swap is about 200,000 gas, a join about 358,000, an exit 290,000 to 302,000, a collect 130,000 to 262,000. That is high. Making everything a setting means reading settings from storage on every call, and the hall's catch-up to the current epoch is inside each. Nothing has been tuned, and fixing settings into the code later will bring it down.
 
-The pool compiles to about 21,000 bytes against a limit of 24,576, so there is room for roughly one more feature before it has to be split.
+The pool compiles to about 22,700 bytes against a limit of 24,576. It is close to full: the next feature that belongs in the pool will need it split in two.
