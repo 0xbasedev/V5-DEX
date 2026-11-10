@@ -216,7 +216,11 @@ def _poisson(rng, lam):
 
 def run(p: Params):
     """Returns (results, hall). Use `simulate` unless you need the Hall itself."""
-    rng = random.Random(p.seed)
+    # Two separate streams of chance, so that two designs run on the same seed face
+    # exactly the same LPs knocking at the door and exactly the same market moves,
+    # whatever each design then does with them.
+    people = random.Random(p.seed)
+    market = random.Random(p.seed + 1_000_003)
     E = p.epochs_per_day
     H = max(1, round(p.horizon_days * E))
     term = round(p.hard_lock_days * E)
@@ -265,14 +269,14 @@ def run(p: Params):
         """Depth as traders and routers count it: recent arrivals are discounted."""
         return (shares - (1 - p.fresh_depth_value) * fresh[0]) * index()
 
-    def open_position(kind, size, stay, tier="soft", terms=1):
+    def open_position(kind, size, stay, tier="soft", terms=1, traits=None):
         nonlocal shares, locked_shares
         s = size / index()
         pid = hall.deposit(kind, s * (p.hard_boost if tier == "hard" else 1.0),
                            H if tier == "hard" and p.hard_skips_ramp else 0)
         meta[pid] = dict(kind=kind, s=s, size=size, e_in=hall.e, tier=tier, price_in=price,
                          e_out=None if stay is None else hall.e + stay, toll_idx=len(toll_events),
-                         lock_end=hall.e + terms * term, budget_at=budget[0])
+                         lock_end=hall.e + terms * term, budget_at=budget[0], traits=traits)
         shares += s
         if tier == "hard":
             locked_shares += s
@@ -386,14 +390,15 @@ def run(p: Params):
         for m in meta.values():
             tally(m, 0)
         for pid in [k for k, m in meta.items() if m["kind"] in KINDS]:
-            if rng.random() < p.passive_pct / 100:
-                continue
             m = meta[pid]
+            nerve, dread = m["traits"][tag]
+            if nerve < p.passive_pct / 100:
+                continue
             value = m["s"] * index()
             q = hall.pos[pid]
             locked = q.earned - q.paid - hall.unlocked_now(pid)
             cost = locked + value * toll_rate(m, hall.e - m["e_in"]) + toll_credit(m)[1]
-            fear = rng.uniform(0, p.shock_fear_pct) / 100 * value
+            fear = dread * p.shock_fear_pct / 100 * value
             if fear > cost + value * p.inertia_pct / 100:
                 close(pid)
         for m in meta.values():
@@ -456,19 +461,21 @@ def run(p: Params):
             close(pid)
 
         # New LPs look at the pool and decide.
-        for _ in range(_poisson(rng, p.arrivals_per_day)):
-            x = rng.random()
+        for _ in range(_poisson(people, p.arrivals_per_day)):
+            x = people.random()
             kind = "hot" if x < p.mix_hot else "medium" if x < p.mix_hot + p.mix_medium else "long"
-            size = p.size_median * math.exp(rng.gauss(0, p.size_sigma))
+            size = p.size_median * math.exp(people.gauss(0, p.size_sigma))
             lo, hi = getattr(p, "hold_" + kind)
-            T = max(1, round(rng.uniform(lo, hi) * E))
-            hurdle = rng.gauss(p.outside_apr_pct, p.outside_apr_sd) + il_drag
+            T = max(1, round(people.uniform(lo, hi) * E))
+            hurdle = people.gauss(p.outside_apr_pct, p.outside_apr_sd) + il_drag
             offered[kind] += size
             second_half = kind == "long" and day >= p.days // 2
             if second_half:
                 late[0] += size
             # Each LP has their own chance of unexpectedly needing the money back.
-            need = rng.expovariate(1 / p.liquidity_need_per_year) if p.liquidity_need_per_year else 0.0
+            need = people.expovariate(1 / p.liquidity_need_per_year) if p.liquidity_need_per_year else 0.0
+            when = people.random()   # drawn for everyone, whether or not they come in
+            traits = {"shock": (people.random(), people.random()), "shock2": (people.random(), people.random())}
             soft = expected_apr(size, T, "soft")
             tier = None
             if term and T >= term:
@@ -486,9 +493,9 @@ def run(p: Params):
                     late[1] += size
                 stay = T
                 if need:
-                    surprise = round(rng.expovariate(need) * per_year)   # when the need actually arrives
+                    surprise = round(-math.log(1 - when) / need * per_year)   # when the need actually arrives
                     stay = max(1, min(T, surprise))
-                open_position(kind, size, stay, tier, terms_for(T))
+                open_position(kind, size, stay, tier, terms_for(T), traits)
 
         # The venue's POL line, and its share of forfeits and tolls, go in as liquidity.
         pol_cash += hall.pol - pol_seen
@@ -501,12 +508,12 @@ def run(p: Params):
         for _ in range(E):
             arb = 0.0
             if volatile:
-                step = sig * rng.gauss(0, 1) - sig * sig / 2
+                step = sig * market.gauss(0, 1) - sig * sig / 2
                 price *= math.exp(step)
                 # Trading needed to move a 50/50 pool to the new price. Moves smaller
                 # than the fee are not worth arbitraging.
                 arb = max(0.0, abs(step) - live.gross_fee_pct / 100) * tvl() / 4
-            noise = math.exp(rng.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
+            noise = math.exp(market.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
             volume = organic_volume(reliable()) / E * noise + arb
             gross = volume * live.gross_fee_pct / 100
             venue = gross * p.venue_cut_pct / 100
