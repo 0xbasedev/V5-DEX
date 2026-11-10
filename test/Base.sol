@@ -5,6 +5,9 @@ pragma solidity 0.8.28;
 interface Vm {
     function warp(uint256) external;
     function getBlockTimestamp() external view returns (uint256);
+    function roll(uint256) external;
+    function getBlockNumber() external view returns (uint256);
+    function chainId(uint256) external;
     function prank(address) external;
     function startPrank(address) external;
     function stopPrank() external;
@@ -30,6 +33,10 @@ abstract contract Base {
     /// change inside one call, which a test that warps makes untrue.
     function _skip(uint256 dt) internal {
         vm.warp(vm.getBlockTimestamp() + dt);
+    }
+
+    function _nextBlock() internal {
+        vm.roll(vm.getBlockNumber() + 1);
     }
 
     function bound(uint256 x, uint256 lo, uint256 hi) internal pure returns (uint256) {

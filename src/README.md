@@ -20,7 +20,11 @@ pnpm test:sim         # the simulator's own tests
 | `VenueSplitter.sol` | Divides one pool's venue cut between the build fund, protocol-owned liquidity, prizes and the buyback line. Before the token exists, half the buyback line goes back to the pool's LPs and half is banked in the escrow, up to the pool's cap. |
 | `BankEscrow.sol` | Holds the banked half, one per chain. It can only hold, release slowly to one fixed address, pause, and refund. |
 | `TimelockedDeployer.sol` | The only way later-written contracts (the outlet, the Engine, the token) can arrive. Their addresses are fixed from day one; their code must be published and wait out a delay. |
-| `Defaults.sol` | The settings a new pool, splitter and escrow start with, each with the reason for it. |
+| `ExchangeToken.sol` | The token: fixed supply minted once, no owner, no mint, burnable. Its code is identical whatever its supply and chain. |
+| `BuybackEngine.sol` | Buys the token with the venue's stables, at most once a block and never above a reference price, and sends it to the Burn Vault. No admin, no settings. |
+| `BurnVault.sol` | Holds the token and burns it on burn day. No withdraw, no admin. |
+| `HomeOutlet.sol` | The outlet on the home chain: passes escrow releases to the Engine. |
+| `Defaults.sol` | The settings a new pool, splitter, escrow, fork and depeg watch start with, each with the reason for it. |
 
 ## The banked half, end to end
 
@@ -32,7 +36,8 @@ This is the part of the design that holds money outside a pool, and the part the
 4. **The pool's hall records it.** Whoever holds seasoned weight in that epoch earns a claim on it. The claim belongs to the wallet, and stays with it if the position is sold or closed.
 5. **Nothing leaves the escrow** until code exists at the outlet's address whose hash matches what the deployer published, that code has been live for an epoch, and no other deploy is waiting. Then at most a fixed share of the ledger goes per epoch, to that address only.
 6. **Any one member of the pause set can stop releases.** Unpausing takes a threshold and a delay. A threshold can remove a member at once, except while a deploy is waiting.
-7. **The money comes back** if no outlet exists by the sunset, or if a pause lasts too long without a break. Each wallet collects by its claim. A refund cannot be paused, pays only what was not already drawn, and closes the escrow for good.
+7. **Once the token exists, the road continues.** The outlet passes each release to the Buyback Engine. The Engine buys the token a little at a time, checking on every buy that the token is the audited one and that it is not paying above its reference price, and sends what it buys to the Burn Vault. On burn day anyone can burn the lot.
+8. **The money comes back** if no outlet exists by the sunset, or if a pause lasts too long without a break. Each wallet collects by its claim. A refund cannot be paused, pays only what was not already drawn, and closes the escrow for good.
 
 ## Everything is a setting
 
@@ -76,7 +81,7 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 
 ## What the tests cover
 
-92 tests in `test/`, no test library needed.
+101 tests in `test/`, no test library needed.
 
 - **Against brute force.** Random opens, exits, collections and fees over 30 epochs, 512 runs. A slow calculation that walks every position every epoch must agree with the hall, the hall may never pay out more than came in, and rounding may never favour a position.
 - **The simulator's named cases**, with the same numbers: the early-exit forfeit, a transfer inside the horizon, a merge.
@@ -90,6 +95,7 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 - **The deployer**: a slot's address is known before anything is deployed there; only the published code can arrive, only after the delay, only once; the outlet cannot arrive after the sunset.
 - **The escrow**: per-pool ledgers and caps; no release without the published outlet, in its first epoch, or while another deploy waits; releases come from every pool in proportion; one member pauses, a threshold unpauses after a delay, a rogue member is removed at once but never while a deploy waits; both refund triggers; a pool that lies cannot take another pool's money; a stray transfer cannot dilute later depositors.
 - **Deferred claims with a real pool**: a late depositor gets only its share of the epochs it was in; a claim stays with the seller of a position and survives closing it; after a partial draw the rest is split by the same claims.
+- **The launch burn, end to end**: a banked fee travels escrow to outlet to Engine to Burn Vault and the supply falls, with the token, the Engine and the outlet each arriving through the timelocked deployer. The token's code is the same whatever its supply, name or chain, and it cannot mint. The Engine stops if the token is not the one it was built for or its supply is above the commitment; buys once a block and never before its start; will not buy into a price someone pushed up; and measures against an outside price when given one. The Burn Vault burns only on burn day and its meter counts only what was burned.
 - **The council's invariants that can be tested on-chain**: a leaver never pays more than the rate written into the position; a pause never blocks an exit and makes it free; no setting can raise a toll on an open position.
 - **Four invariants under random use**: every token the pool holds is accounted for to the wei; every position can always leave; the escrow's ledger is always covered; and money leaves the escrow only to the outlet or as a refund.
 
@@ -119,6 +125,12 @@ On the fork and the depeg watch:
 - **A fork costs gas**: three passes over the curve per swap instead of one.
 - **The depeg watch needs people to call it.** It reports a depeg only if readings kept coming in throughout the window.
 
+On the launch burn:
+
+- **The Engine's own average is built from readings anyone may trigger.** With no outside price, whoever alone triggers readings can lean on it. The premium limit, the size of each buy and the length of the window bound the damage, and a keeper reading every block removes most of it. A price record kept by the pool itself would be sturdier; the pool has no room for one until it is split.
+- **Everything the Engine buys is burned.** The spec also mentions paying some of it to seasoned LPs; that split is not built.
+- **The Burn Vault is deployed plainly, not through the timelocked deployer.** It has no admin and nothing to configure, and the Engine's published code names its address.
+
 Where the escrow departs from spec v1.16, on purpose:
 
 9. **The cap is per pool, not per chain.** Anyone may bank for any pool, so one chain-wide cap could be filled by a stranger to push every real pool's share to its LPs instead.
@@ -133,12 +145,13 @@ Where the escrow departs from spec v1.16, on purpose:
 ## Not built yet
 
 - The auto-compounding vault. Compounding itself is built, and uses only as much of each token as fits the pool's proportions; it does not swap the excess.
-- The outlet, the Engine and the token themselves. The escrow and deployer are ready for them; they are later-phase contracts.
+- The outlet for chains other than home, which has to carry money across chains.
+- Locks on the token, gauges and bribes.
 - A router, and per-transaction permits.
 - A timelock in front of the configurer, and anything that moves the fee automatically.
 - An outside price source. The fork's pitch and the depeg watch both read one through a one-function interface; no adapter to a real oracle exists yet.
 - Ramping the amplified curve's amplification, which is fixed per pool.
-- A shared hall, the token, locks on the token, gauges.
+- A shared hall.
 - Deployment scripts and the deterministic addresses.
 
 ## Gas and size, first reading
