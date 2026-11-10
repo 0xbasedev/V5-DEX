@@ -39,7 +39,7 @@ class ModelChecks(unittest.TestCase):
         self.assertLess(volatile_loss, stable_loss)
 
     def test_tolls_paid_to_lockers_reach_nobody_else(self):
-        base = Params(days=200, seed=5).but(**SCENARIOS["twoshock"]).but(days=200)
+        base = Params(days=200, seed=5).but(**SCENARIOS["twoshock"]).but(days=200, hard_boost=1.5)
         for mode in (1, 2):
             out, hall = run(base.but(toll_mode=mode))
             self.assertGreater(out["principal_tolls"], 0)
@@ -64,7 +64,7 @@ class ModelChecks(unittest.TestCase):
         self.assertEqual(market_volume(p.but(demand_elasticity=0), dear), p.market_daily_volume)
 
     def test_lps_price_the_lock(self):
-        base = Params(days=150, seed=2).but(**SCENARIOS["hardlock"])
+        base = Params(days=150, seed=2).but(**SCENARIOS["hardlock"]).but(hard_boost=1.5)
         take = lambda **kw: run(base.but(**kw))[0]["lock_take_pct"]
         # A dearer exit, a smaller boost, more need for cash or more dislike of risk: fewer take the lock.
         self.assertLess(take(hard_exit_pct=20), take(hard_exit_pct=2))
@@ -77,6 +77,16 @@ class ModelChecks(unittest.TestCase):
         # With needs, some locked LPs pay to leave even in calm times.
         needy = run(base.but(shock_day=-1))[0]
         self.assertGreater(needy["principal_tolls"], 0)
+
+    def test_no_boost_needs_another_reason_to_lock(self):
+        base = Params(seed=1).but(**SCENARIOS["twoshock"]).but(hard_exit_pct=10, lock_melt_floor=1.0)
+        self.assertEqual(base.hard_boost, 1.0)
+        self.assertEqual(run(base)[0]["lock_take_pct"], 0)                      # nothing to gain
+        self.assertEqual(run(base.but(toll_mode=1))[0]["lock_take_pct"], 0)     # no lockers, so no tolls to share
+        self.assertGreater(run(base.but(hard_skips_ramp=1))[0]["lock_take_pct"], 0)
+        paid = run(base.but(lock_budget_pct=30))[0]
+        self.assertGreater(paid["lock_take_pct"], 0)
+        self.assertGreater(paid["lock_budget_paid"], 0)
 
     def test_rolling_and_non_melting_locks(self):
         base = Params(seed=4).but(**SCENARIOS["twoshock"]).but(hard_boost=1.25, hard_exit_pct=10)

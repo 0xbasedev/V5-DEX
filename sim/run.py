@@ -72,6 +72,7 @@ ROWS = [
     ("forfeited_fees", "Fees forfeited by early leavers"),
     ("principal_tolls", "Principal paid to leave a lock early"),
     ("tolls_to_lockers", "  of which paid on to LPs who stayed locked"),
+    ("lock_budget_paid", "Venue cut paid to locked LPs"),
 ]
 
 
@@ -142,7 +143,7 @@ def sweep_lock(p, seeds, name):
     """Weight boost for a locked position by the cost of leaving early."""
     if not p.hard_lock_days:
         raise SystemExit("this scenario has no hard lock; try --scenario hardlock")
-    boosts = [1.1, 1.25, 1.5, 2.0, 3.0]
+    boosts = [1.0, 1.1, 1.25, 1.5, 2.0]
     exits = [2, 5, 10, 20]
     cols = ["lock_take_pct", "hard_share_pct", "tvl_avg", "shock_retained_pct", "apr_locked",
             "apr_unlocked_long", "principal_tolls", "pol_value"]

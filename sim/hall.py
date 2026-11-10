@@ -85,8 +85,10 @@ class _Common:
     def add_bank(self, x):
         self.pending_bank += x
 
-    def deposit(self, owner, shares):
-        return self._new(Pos(owner, shares, self.e, self.e))
+    def deposit(self, owner, shares, age=0):
+        """Open a position. `age` lets it start part-seasoned (used for a tier that
+        skips the ramp); it earns nothing for the time before it existed."""
+        return self._new(Pos(owner, shares, self.e - age, self.e))
 
     def unlocked_now(self, pid):
         p = self.pos[pid]

@@ -25,7 +25,9 @@ class Params:
 
     # --- hard-lock tier (spec §3, all OPEN; 0 days switches it off) ---
     hard_lock_days: float = 0
-    hard_boost: float = 1.5          # weight multiplier for a locked position
+    hard_boost: float = 1.0          # weight multiplier for a locked position (ruled out by Jess: keep at 1)
+    hard_skips_ramp: int = 0         # 1: a locked position has full weight and unlocked fees from day one
+    lock_budget_pct: float = 0       # share of the venue cut paid to locked LPs, by size
     hard_exit_pct: float = 5         # principal cost of leaving on the first day of a term
     lock_melt_floor: float = 0.0     # how far the exit cost melts within a term: 0 melts to nothing by the end,
                                      # 0.5 stops at half, 1 never melts. It is always zero once the lock has ended.
@@ -234,7 +236,7 @@ def run(p: Params):
     done = []     # dict per finished or still-open position
     shares = 0.0  # real shares in the pool; weight boosts live only in the Hall
     out = dict(volume=0.0, lp_fees=0.0, build=0.0, banked=0.0, bank_overflow_to_lps=0.0,
-               forfeited_fees=0.0, principal_tolls=0.0, venue_cut=0.0, tolls_to_lockers=0.0)
+               forfeited_fees=0.0, principal_tolls=0.0, venue_cut=0.0, tolls_to_lockers=0.0, lock_budget_paid=0.0)
     offered = {k: 0.0 for k in KINDS}
     accepted = {k: 0.0 for k in KINDS}
     late = [0.0, 0.0]   # long capital offered and accepted in the second half
@@ -242,6 +244,8 @@ def run(p: Params):
     seasoned_days, tvl_days, hard_days = [], [], []
     shock = {}   # what the pool looked like at each shock, and who stayed
     toll_events = []     # (epoch, dollars per locked share) for tolls paid to lockers
+    toll_flow = [0.0, 0.0]   # tolls paid to lockers today, and their smoothed daily yield per locked dollar
+    budget = [0.0, 0.0, 0.0]   # lock budget: dollars paid per locked share so far, paid today, smoothed daily total
     locked_shares = 0.0
 
     def tvl():
@@ -250,10 +254,11 @@ def run(p: Params):
     def open_position(kind, size, stay, tier="soft", terms=1):
         nonlocal shares, locked_shares
         s = size / index()
-        pid = hall.deposit(kind, s * (p.hard_boost if tier == "hard" else 1.0))
+        pid = hall.deposit(kind, s * (p.hard_boost if tier == "hard" else 1.0),
+                           H if tier == "hard" and p.hard_skips_ramp else 0)
         meta[pid] = dict(kind=kind, s=s, size=size, e_in=hall.e, tier=tier, price_in=price,
                          e_out=None if stay is None else hall.e + stay, toll_idx=len(toll_events),
-                         lock_end=hall.e + terms * term)
+                         lock_end=hall.e + terms * term, budget_at=budget[0])
         shares += s
         if tier == "hard":
             locked_shares += s
@@ -270,10 +275,14 @@ def run(p: Params):
             waiting += per_share * (1 - done_frac)
         return m["s"] * got, m["s"] * waiting
 
+    def budget_income(m):
+        return m["s"] * (budget[0] - m["budget_at"]) if m["tier"] == "hard" else 0.0
+
     def pay_lockers(amount):
         if amount <= 0:
             return
         out["tolls_to_lockers"] += amount
+        toll_flow[0] += amount
         if locked_shares > 0:
             toll_events.append((hall.e, amount / locked_shares))
         else:
@@ -311,7 +320,7 @@ def run(p: Params):
             hall.add_fees(toll * (1 - pol_cut))
         out["forfeited_fees"] += forfeited
         out["principal_tolls"] += toll
-        done.append(dict(m, t=age, fees=cash - toll + got, il=price_loss(m)))
+        done.append(dict(m, t=age, fees=cash - toll + got + budget_income(m), il=price_loss(m)))
 
     live = p              # p with our fee as it stands today
     pending = None        # (day it takes effect, fee) while a change waits out its timelock
@@ -333,13 +342,15 @@ def run(p: Params):
 
     def expected_apr(size, T, tier):
         """What a newcomer expects over a stay of T epochs if fees keep their recent pace."""
-        if T <= H:
+        if tier == "hard" and p.hard_skips_ramp:
+            sum_w = T
+        elif T <= H:
             sum_w = T * p.floor + (1 - p.floor) * (T * (T - 1) / 2) / H
         else:
             sum_w = H * p.floor + (1 - p.floor) * (H - 1) / 2 + (T - H)
         s = size / index() * (p.hard_boost if tier == "hard" else 1.0)
         per_weight = rate / (hall.W + s * sum_w / T)
-        kept = s * per_weight * sum_w * ramp(p.u0, T, H)
+        kept = s * per_weight * sum_w * (1.0 if tier == "hard" and p.hard_skips_ramp else ramp(p.u0, T, H))
         toll = 0.0 if tier == "hard" else size * p.principal_floor_pct / 100 * max(0.0, 1 - T / H)
         return (kept - toll) / size * per_year / T * 100
 
@@ -448,7 +459,9 @@ def run(p: Params):
             tier = None
             if term and T >= term:
                 lock_offered[0] += size
-                if expected_apr(size, T, "hard") - lock_price(need, T) >= max(hurdle, soft):
+                toll_income = toll_flow[1] * 365 * 100 if p.toll_mode else 0.0   # what lockers have been earning from tolls
+                toll_income += budget[2] * 365 * 100 / (locked_shares * index() + size)   # their share of the lock budget
+                if expected_apr(size, T, "hard") + toll_income - lock_price(need, T) >= max(hurdle, soft):
                     tier = "hard"
                     lock_offered[1] += size
             if tier is None and soft >= hurdle:
@@ -482,9 +495,17 @@ def run(p: Params):
             volume = organic_volume(tvl()) / E * noise + arb
             gross = volume * live.gross_fee_pct / 100
             venue = gross * p.venue_cut_pct / 100
+            to_lockers = venue * p.lock_budget_pct / 100
+            venue -= to_lockers
             buyback = venue * p.buyback_pct / 100
             to_bank = min(buyback / 2, max(0.0, p.holding_cap - out["banked"]))
-            to_hall = gross - venue + buyback - to_bank
+            to_hall = gross - venue - to_lockers + buyback - to_bank
+            if to_lockers and locked_shares > 0:
+                budget[0] += to_lockers / locked_shares
+                out["lock_budget_paid"] += to_lockers
+            else:
+                to_hall += to_lockers   # nobody locked: it goes to all LPs
+            budget[1] += to_lockers
             hall.add_fees(to_hall)
             hall.add_bank(to_bank)
             out["volume"] += volume
@@ -509,6 +530,11 @@ def run(p: Params):
             rival_tvl *= max(0.5, min(2.0, ratio)) ** (p.competitor_depth_speed / 100)
             rival_tvl = max(0.02 * p.competitor_tvl, min(5 * p.competitor_tvl, rival_tvl))
         market_seen[2] = 0.0
+        budget[2] += (budget[1] - budget[2]) / 7
+        budget[1] = 0.0
+        locked_value = locked_shares * index()
+        toll_flow[1] += (toll_flow[0] / locked_value if locked_value else 0.0) / 30 - toll_flow[1] / 30
+        toll_flow[0] = 0.0
         tvl_days.append(tvl())
         hard_days.append(sum(m["s"] for m in meta.values() if m["tier"] == "hard") / shares)
         if hall.e >= H:
@@ -517,7 +543,7 @@ def run(p: Params):
     hall.settle_all()
     for pid, m in meta.items():
         # Still in at the end: count what they have earned, on the view that they stay to unlock it.
-        done.append(dict(m, t=hall.e - m["e_in"], fees=hall.pos[pid].earned + sum(toll_credit(m)),
+        done.append(dict(m, t=hall.e - m["e_in"], fees=hall.pos[pid].earned + sum(toll_credit(m)) + budget_income(m),
                          il=price_loss(m)))
 
     def apr(rows, net):
