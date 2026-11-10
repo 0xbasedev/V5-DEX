@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Base, Token} from "./Base.sol";
 import {PoolSetup} from "./V5Pool.t.sol";
 import {V5Pool} from "../src/V5Pool.sol";
+import {PoolConfig, FeePolicy} from "../src/PoolTypes.sol";
 import {StableMath} from "../src/StableMath.sol";
 
 contract StableMathTest is Base {
@@ -66,7 +67,7 @@ contract StablePoolTest is PoolSetup {
 
     function _stable(uint256 amp) internal returns (V5Pool p) {
         p = new V5Pool(
-            V5Pool.PoolConfig(address(a), address(b), 0.5e18, EPOCH, 0.0005e18, 0.1e18, type(uint256).max, amp),
+            PoolConfig(address(a), address(b), 0.5e18, EPOCH, 0.0005e18, 0.1e18, type(uint256).max, amp, curve),
             _roles(),
             _hallConfig(),
             _feePolicyFor(0.0005e18)
@@ -75,7 +76,7 @@ contract StablePoolTest is PoolSetup {
         _fund(trader, p);
     }
 
-    function _feePolicyFor(uint256 fee) internal pure returns (V5Pool.FeePolicy memory f) {
+    function _feePolicyFor(uint256 fee) internal pure returns (FeePolicy memory f) {
         f = _feePolicy();
         f.feeMinWad = fee * 4 / 10;
         f.feeMaxWad = fee;
@@ -116,7 +117,7 @@ contract StablePoolTest is PoolSetup {
     function test_aPegPoolMustBeBalancedByWeight() public {
         vm.expectRevert();
         new V5Pool(
-            V5Pool.PoolConfig(address(a), address(b), 0.8e18, EPOCH, 0.0005e18, 0.1e18, type(uint256).max, 100),
+            PoolConfig(address(a), address(b), 0.8e18, EPOCH, 0.0005e18, 0.1e18, type(uint256).max, 100, curve),
             _roles(),
             _hallConfig(),
             _feePolicyFor(0.0005e18)

@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {EpochHall} from "./EpochHall.sol";
-import {V5Pool} from "./V5Pool.sol";
+import {FeePolicy} from "./PoolTypes.sol";
 import {VenueSplitter} from "./VenueSplitter.sol";
 import {BankEscrow} from "./BankEscrow.sol";
 import {TuningFork} from "./TuningFork.sol";
@@ -41,11 +41,12 @@ library Defaults {
         c.tollPolShareWad = 0;
     }
 
+    /// The policy the fee desk holds for a new pool.
     /// `feeWad` is the fee the pool opens with: whatever is competitive for the
     /// pair, for example 0.0005e18 for a stable pair or 0.003e18 for a volatile one.
     /// `referenceAprWad` is what LPs in this pair can earn elsewhere. It has to
     /// be chosen per pool; set too low, the venue overcharges.
-    function fees(uint256 feeWad, uint256 referenceAprWad) internal pure returns (V5Pool.FeePolicy memory f) {
+    function fees(uint256 feeWad, uint256 referenceAprWad) internal pure returns (FeePolicy memory f) {
         // The fee may fall to 0.4 of where it opened and never rise above it.
         // A decrease lands in a day, an increase in two weeks (ruling 3).
         f.feeMinWad = feeWad * 4 / 10;

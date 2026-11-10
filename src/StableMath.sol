@@ -58,7 +58,11 @@ library StableMath {
     /// next sliver of x buys. It is the ratio of the invariant's two slopes,
     /// (2A + D^3/(4x^2 y)) / (2A + D^3/(4x y^2)).
     function price(uint256 x, uint256 y, uint256 amp) internal pure returns (uint256) {
-        uint256 d = invariant(x, y, amp);
+        return priceAt(x, y, invariant(x, y, amp), amp);
+    }
+
+    /// The same price, for a caller that already knows the invariant `d`.
+    function priceAt(uint256 x, uint256 y, uint256 d, uint256 amp) internal pure returns (uint256) {
         uint256 ann = amp * 2;
         uint256 dp = d * d / (x * 2) * d / (y * 2);
         return FixedPointMathLib.fullMulDiv((ann * x + dp) * y, 1e18, (ann * y + dp) * x);
@@ -71,7 +75,15 @@ library StableMath {
         pure
         returns (uint256)
     {
-        uint256 d = invariant(balanceIn, balanceOut, amp);
+        return amountOutAt(balanceIn, balanceOut, amountIn, invariant(balanceIn, balanceOut, amp), amp);
+    }
+
+    /// The same amount, for a caller that already knows the invariant `d` of the two balances.
+    function amountOutAt(uint256 balanceIn, uint256 balanceOut, uint256 amountIn, uint256 d, uint256 amp)
+        internal
+        pure
+        returns (uint256)
+    {
         uint256 y = otherBalance(balanceIn + amountIn, d, amp);
         // Each solve is only good to its last unit, so take a few units off:
         // enough that no sequence of trades can come out ahead on rounding.

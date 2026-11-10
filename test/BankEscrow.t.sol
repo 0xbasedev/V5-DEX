@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Token} from "./Base.sol";
 import {PoolSetup} from "./V5Pool.t.sol";
 import {V5Pool} from "../src/V5Pool.sol";
+import {Roles} from "../src/PoolTypes.sol";
 import {VenueSplitter, IV5PoolForSplitter} from "../src/VenueSplitter.sol";
 import {BankEscrow, IDeployerForEscrow} from "../src/BankEscrow.sol";
 import {TimelockedDeployer} from "../src/TimelockedDeployer.sol";
@@ -77,7 +78,7 @@ abstract contract EscrowSetup is PoolSetup {
         splitter = new VenueSplitter(
             IV5PoolForSplitter(address(pool)), Defaults.lines(build, pol, prize, address(escrow), converter), configurer
         );
-        V5Pool.Roles memory r = _roles();
+        Roles memory r = _roles();
         r.venue = address(splitter);
         vm.prank(configurer);
         pool.setRoles(r);

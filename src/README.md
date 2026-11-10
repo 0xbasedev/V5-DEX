@@ -14,14 +14,17 @@ pnpm test:sim         # the simulator's own tests
 |---|---|
 | `EpochHall.sol` | Seasoned-position bookkeeping: the weight ramp, constant-time fee settlement, the fee hold, forfeits on early exit, the hard lock and its toll, tolls paid to lockers, transfer and merge. A Solidity port of `sim/hall.py`. |
 | `StableMath.sol` | The amplified curve for peg pairs. |
-| `V5Pool.sol` | A two-token pool built on the hall, with a weighted curve for general pairs or the amplified curve for peg pairs. Swap fees go to the hall's ledger and to the venue, never into reserves. Joining opens a position; there is no LP token. The fee moves inside bounds, and the venue cut can set itself. |
+| `V5Pool.sol` | A two-token pool built on the hall. It holds the money, the positions and the fee terms it charges by, and keeps its own record of its price. Swap fees go to the hall's ledger and to the venue, never into reserves. Joining opens a position; there is no LP token. |
+| `PoolCurve.sol` | The swap arithmetic for every pool: the weighted curve, the amplified curve, the fee on a trade and the price. It keeps nothing and holds nothing; pools only read from it. One deployment serves all of them. |
+| `FeeDesk.sol` | The rules a pool's fee terms are set by: the fee's bounds and delays, and the venue cut that sets itself each week or is set by hand. The only address a pool lets set its terms. One deployment serves every pool. |
+| `PoolTypes.sol` | The shapes the three pass to one another. |
 | `TuningFork.sol` | The directional fee for peg pools: cheap toward the pitch, dearer the further away, charged over the whole price move. A fee model the pool consults on swaps. |
 | `DepegWatch.sol` | Reports when an outside price has been off its peg for a full window. While it does, exits are free. |
 | `VenueSplitter.sol` | Divides one pool's venue cut between the build fund, protocol-owned liquidity, prizes and the buyback line. Before the token exists, half the buyback line goes back to the pool's LPs and half is banked in the escrow, up to the pool's cap. |
 | `BankEscrow.sol` | Holds the banked half, one per chain. It can only hold, release slowly to one fixed address, pause, and refund. |
 | `TimelockedDeployer.sol` | The only way later-written contracts (the outlet, the Engine, the token) can arrive. Their addresses are fixed from day one; their code must be published and wait out a delay. |
 | `ExchangeToken.sol` | The token: fixed supply minted once, no owner, no mint, burnable. Its code is identical whatever its supply and chain. |
-| `BuybackEngine.sol` | Buys the token with the venue's stables, at most once a block and never above a reference price, and sends it to the Burn Vault. No admin, no settings. |
+| `BuybackEngine.sol` | Buys the token with the venue's stables, at most once a block and never above a reference price, and sends it to the Burn Vault. Without an outside price the reference is the pool's own average. No admin, no settings. |
 | `BurnVault.sol` | Holds the token and burns it on burn day. No withdraw, no admin. |
 | `TokenLock.sol` | Locking the token for a share of fees and a vote. An Epoch Hall whose stake is the token: longer locks weigh more, leaving early costs less as the lock runs, and that cost is split between a burn and the lockers who stayed. |
 | `Gauges.sol` | Weekly votes by lockers direct a boost budget of real fees to pools, with a cap on any one pool. Bribes for votes, with decay. |
@@ -46,17 +49,18 @@ This is the part of the design that holds money outside a pool, and the part the
 Nothing about the economics is hard-coded yet. The `configurer` can change any of it on a live pool:
 
 - **The hall's settings** (`setHallConfig`): floor, horizon, fee hold, POL share of forfeits, lock term, exit cost, how far it melts, whether a lock skips the ramp, and where lock tolls go.
-- **The fee policy** (`setFeePolicy`): the fee's bounds and delays, whether the venue cut sets itself and how, and the share of the cut paid to lockers.
-- **The roles** (`setRoles`): who receives the venue cut and POL, who may pause, raise the cap, queue a fee, and configure.
+- **The fee policy** (`FeeDesk.setPolicy`): the fee's bounds and delays, whether the venue cut sets itself and how, the share of the cut paid to lockers, and the fee model.
+- **The roles** (`setRoles`): who receives the venue cut and POL, who may pause, raise the cap, queue a fee, and configure, and which fee desk the pool listens to.
 
-Two protections hold whatever is changed:
+Three protections hold whatever is changed:
 
 - **A position keeps the terms it opened under.** A change to the hall's settings reaches only positions opened afterwards, so no change can raise what it costs someone already in to leave.
-- **An exit cannot be blocked.** No setting, role or pause stops one.
+- **An exit cannot be blocked.** No setting, role or pause stops one. Neither the curve contract's fee model nor the fee desk is on the path of an exit.
+- **The pool has ceilings of its own.** It refuses a fee above 10% and a share above the whole, whoever asks, and no fee model can charge more than that 10%.
 
 Handing the configurer role to the zero address freezes every setting for good. That is how a setting gets "merged into hard code" before the code itself is rewritten.
 
-Only the two tokens, their weights and the epoch length cannot change.
+Only the two tokens, their weights, the curve contract and the epoch length cannot change.
 
 ## The defaults, and why
 
@@ -83,7 +87,7 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 
 ## What the tests cover
 
-114 tests in `test/`, no test library needed.
+132 tests in `test/`, no test library needed.
 
 - **Against brute force.** Random opens, exits, collections and fees over 30 epochs, 512 runs. A slow calculation that walks every position every epoch must agree with the hall, the hall may never pay out more than came in, and rounding may never favour a position.
 - **The simulator's named cases**, with the same numbers: the early-exit forfeit, a transfer inside the horizon, a merge.
@@ -100,6 +104,8 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 - **The launch burn, end to end**: a banked fee travels escrow to outlet to Engine to Burn Vault and the supply falls, with the token, the Engine and the outlet each arriving through the timelocked deployer. The token's code is the same whatever its supply, name or chain, and it cannot mint. The Engine stops if the token is not the one it was built for or its supply is above the commitment; buys once a block and never before its start; will not buy into a price someone pushed up; and measures against an outside price when given one. The Burn Vault burns only on burn day and its meter counts only what was burned.
 - **The token lock**: a longer lock weighs and earns more; lengths are bounded; leaving early costs half on day one and a quarter half way, split between the burn and the stayers; with nobody else locked the whole cost is burned; a lock that has run leaves free, cannot vote, and can be closed by anyone for its owner; a lock can be sold and keeps its terms; locks cannot be merged.
 - **The gauges**: votes direct the budget to pools as fees for their LPs, capped per pool, with the remainder rolling on; a vote can be split and must add up; only listed pools, only the lock's owner, only a lock that outlasts the week; a bribe is shared by those who voted for the pool, reaches a voter who has since closed their lock, and decays to the buyback path if not collected.
+- **The split**: a pool will not open without a curve contract and a fee desk; the pool pays exactly what the curve quotes, whichever way the trade faces; no fee model can charge above the ceiling; a price too small to write down stops nothing. Only the desk sets a pool's terms, and the pool refuses terms above its ceilings from any desk; a desk that fails to answer a review, or answers with nonsense, never stops a swap; a new policy pulls the fee and the cut inside its bounds; with the configurer gone the policy is frozen; a desk the pool has left can no longer touch it.
+- **The price record**: it is the price weighted by how long it stood; a price moved and put back inside one block leaves no mark; each block's first trade writes the price it found, not the one it left; joining and leaving move neither the price nor the record. The Engine's average is the pool's, the right way up, and whoever takes its readings cannot lean on it.
 - **The council's invariants that can be tested on-chain**: a leaver never pays more than the rate written into the position; a pause never blocks an exit and makes it free; no setting can raise a toll on an open position.
 - **Four invariants under random use**: every token the pool holds is accounted for to the wei; every position can always leave; the escrow's ledger is always covered; and money leaves the escrow only to the outlet or as a refund.
 
@@ -107,6 +113,20 @@ The tests have found two real faults so far, both fixed and both now guarded:
 
 - A rounding leak in the hall that let it owe up to one wei more per epoch than it held.
 - In the amplified curve, with no fee, a there-and-back trade could return one wei more than went in, because the solver is accurate only to its last unit. The amount out now holds back a few units.
+
+## How a pool is split
+
+A pool was one contract and had reached its size limit. It is now three, split along the line between what must be trusted with money and what only has to be right:
+
+- **The pool** holds the reserves, the positions, the fees and the fee terms in force. Nothing else can move any of it.
+- **The curve** does arithmetic. The pool asks it what a trade buys and what the price is, by a call that cannot change anything, and trusts the answer. A wrong curve would misprice every trade, so a pool must only be opened on the audited deployment; the address is fixed for the pool's life.
+- **The desk** holds the rules the terms are set by. It is the only address the pool lets set them, and the pool checks every set of terms against its own ceilings. The pool asks the desk once a review period what the venue cut should be; if the desk fails or answers with more than the whole, nothing changes and it is asked again a day later. The configurer can point a pool at a different desk.
+
+What that bought, measured: the pool is at 20,649 bytes of 24,576 with the price record added, where it was at 23,033 without it; and a swap costs about a fifth less, because it reads its terms from two storage slots instead of the thirteen the policy took.
+
+What it did not buy: much room. Most of the pool is joining, leaving, swapping and the hall's settlement, which cannot be moved out without putting a contract boundary between a position and its liquidity. That is the next split if the pool needs to grow again, and it is a larger one.
+
+**The price record.** On the first swap of each block the pool adds the logarithm of the price it found, times the seconds since it last wrote, to a running sum. Two readings of the sum give the geometric average price between them, in either direction. Only swaps write it and each writes the price before it trades, so a price pushed and restored inside one block never enters, and whoever takes readings chooses only when an average starts and ends. It has the limit every such record has: a price left standing at the end of a block counts until the next trade, so moving the average means holding the price against everyone free to trade it back.
 
 ## Structural choices still open
 
@@ -116,22 +136,22 @@ These are about how the contracts are built, not what they are set to.
 2. **A position is a record, not yet an NFT.** It can be handed over with `transferPosition`, and its age, lock and held fees travel with it. Wallets and marketplaces will not see it.
 3. **Forfeits and tolls leave the reserves** and are paid out as fees. The spec says they "stay in the pool as depth". Doing that needs POL to hold a position, which is not built.
 4. **Tolls are paid to lockers at once**, not streamed over a term. The simulator found no difference in retention, and paying at once costs constant gas.
-5. **The venue cut's review reads the pool's own price** to value fees in one token. Someone could skew one review by moving the price first; the damage is capped at one step of the cut.
+5. **The venue cut's review reads the pool's own price** to value fees in one token (a peg pair's are valued at the peg). Someone could skew one review by moving the price first; the damage is capped at one step of the cut.
 6. **The guardian can pause and unpause** a pool. While paused, joins and swaps stop and every exit is free of forfeits and tolls.
 7. **Two tokens only.** Tokens that take a fee on transfer or change balances by themselves are not supported.
 8. **All rounding is against the position or the trader.**
 
 On the fork and the depeg watch:
 
-- **The fork is a separate contract the pool consults**, not code inside the pool. That keeps the pool under its size limit and means a pool can run with no fork or a different fee model. It is on the swap path only and cannot touch an exit.
+- **The fork is a separate contract**, consulted by the curve contract while it prices a swap. A pool can run with no fork or a different fee model. It is on the swap path only and cannot touch an exit.
 - **The whole fee, surcharge included, goes down the usual waterfall.** The spec leaves a separate LP/POL split of the directional fee as a config field; it is not built.
 - **"Charged over the whole move" is an average along the trade weighted by amount traded**, taken at three points. It is close to exact, not exact.
-- **A fork costs gas**: three passes over the curve per swap instead of one.
+- **A fork costs gas**: three passes over the curve per swap instead of one. On a peg pair the curve's invariant is solved once and reused for all three, so the prices half way and at the end are taken on the curve the trade started on, which is the fee-less path the fork is meant to measure.
 - **The depeg watch needs people to call it.** It reports a depeg only if readings kept coming in throughout the window.
 
 On the launch burn:
 
-- **The Engine's own average is built from readings anyone may trigger.** With no outside price, whoever alone triggers readings can lean on it. The premium limit, the size of each buy and the length of the window bound the damage, and a keeper reading every block removes most of it. A price record kept by the pool itself would be sturdier; the pool has no room for one until it is split.
+- **Without an outside price, the Engine measures against the pool's own average**, read from the pool's price record. Anyone may mark where the record stands; that fixes a time, not a price. Before the token trades anywhere else the pool's price is the only price there is, so someone prepared to hold it up for most of a window, against everyone free to sell into it, would raise the average. The premium limit and the size of each buy bound what that earns.
 - **Everything the Engine buys is burned.** The spec also mentions paying some of it to seasoned LPs; that split is not built.
 - **The Burn Vault is deployed plainly, not through the timelocked deployer.** It has no admin and nothing to configure, and the Engine's published code names its address.
 
@@ -170,6 +190,15 @@ Where the escrow departs from spec v1.16, on purpose:
 
 ## Gas and size, first reading
 
-The contracts are now compiled through the IR pipeline, which shrank the pool by about 3,500 bytes. With the amplified curve, the fee-model hook and the depeg waiver added it stands at about 23,000 against a limit of 24,576. It is full: the next thing that belongs inside the pool means splitting it first. One side effect matters for tests only: a test that moves the clock must read the time through the cheatcode, as `test/Base.sol` does.
+The contracts are compiled through the IR pipeline. One side effect matters for tests only: a test that moves the clock must read the time through the cheatcode, as `test/Base.sol` does.
 
-A swap is about 200,000 gas, a join about 358,000, an exit about 300,000. That is high. Every setting is read from storage on every call, and the hall's catch-up to the current epoch is inside each. Nothing has been tuned, and fixing settings into the code later will bring it down.
+| Contract | Size in bytes | Limit 24,576 |
+|---|---|---|
+| `V5Pool` | 20,649 | 3,927 to spare |
+| `TokenLock` | 11,960 | |
+| `BankEscrow` | 7,131 | |
+| `Gauges` | 6,541 | |
+| `FeeDesk` | 4,984 | |
+| `PoolCurve` | 3,829 | |
+
+In the tests a swap is about 162,000 gas at the median (it was 203,000 before the split), a join about 379,000 for the first into a pool, an exit about 300,000. That is still high. The hall's catch-up to the current epoch is inside each call and nothing has been tuned. A gas pass is its own piece of work.

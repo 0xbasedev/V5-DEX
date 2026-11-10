@@ -3,10 +3,17 @@ pragma solidity 0.8.28;
 
 import {Base, Token} from "./Base.sol";
 import {V5Pool} from "../src/V5Pool.sol";
+import {PoolConfig, Roles, FeePolicy} from "../src/PoolTypes.sol";
 import {EpochHall} from "../src/EpochHall.sol";
 import {Defaults} from "../src/Defaults.sol";
+import {PoolCurve} from "../src/PoolCurve.sol";
+import {FeeDesk} from "../src/FeeDesk.sol";
 
 abstract contract PoolSetup is Base {
+    /// One curve contract serves every pool a test opens.
+    address internal curve = address(new PoolCurve());
+    /// And one fee desk.
+    FeeDesk internal desk = new FeeDesk();
     uint256 constant EPOCH = 6 hours;
     Token a;
     Token b;
@@ -28,26 +35,26 @@ abstract contract PoolSetup is Base {
     }
 
     /// A fee between 0.1% and 0.3%, a flat venue cut, nothing to lockers.
-    function _feePolicy() internal pure returns (V5Pool.FeePolicy memory) {
-        return V5Pool.FeePolicy(
+    function _feePolicy() internal pure returns (FeePolicy memory) {
+        return FeePolicy(
             0.001e18, 0.003e18, 1 days, 14 days, false, 0.5e18, 0.06e18, 0.05e18, 0.4e18, 0.05e18, 7 days, 0, address(0)
         );
     }
 
-    function _roles() internal view returns (V5Pool.Roles memory) {
-        return V5Pool.Roles(venue, pol, guardian, capRaiser, configurer, feeSetter, bankRole, address(0));
+    function _roles() internal view returns (Roles memory) {
+        return Roles(venue, pol, guardian, capRaiser, configurer, feeSetter, bankRole, address(0), address(desk));
     }
 
     function _pool(uint256 weight0, uint256 cap) internal returns (V5Pool) {
         return _pool(weight0, cap, _hallConfig(), _feePolicy());
     }
 
-    function _pool(uint256 weight0, uint256 cap, EpochHall.HallConfig memory h, V5Pool.FeePolicy memory f)
+    function _pool(uint256 weight0, uint256 cap, EpochHall.HallConfig memory h, FeePolicy memory f)
         internal
         returns (V5Pool)
     {
         return new V5Pool(
-            V5Pool.PoolConfig(address(a), address(b), weight0, EPOCH, 0.003e18, 0.1e18, cap, 0), _roles(), h, f
+            PoolConfig(address(a), address(b), weight0, EPOCH, 0.003e18, 0.1e18, cap, 0, curve), _roles(), h, f
         );
     }
 
@@ -347,8 +354,16 @@ contract V5PoolSettingsTest is PoolSetup {
     function test_aPoolOpensOnTheDefaults() public {
         V5Pool p = _ready(
             new V5Pool(
-                V5Pool.PoolConfig(
-                    address(a), address(b), 0.5e18, Defaults.EPOCH, 0.003e18, Defaults.OPENING_CUT, type(uint256).max, 0
+                PoolConfig(
+                    address(a),
+                    address(b),
+                    0.5e18,
+                    Defaults.EPOCH,
+                    0.003e18,
+                    Defaults.OPENING_CUT,
+                    type(uint256).max,
+                    0,
+                    curve
                 ),
                 _roles(),
                 Defaults.hall(),
@@ -361,7 +376,7 @@ contract V5PoolSettingsTest is PoolSetup {
         vm.assertApproxEqAbs(p.weightOf(locked), 1000e18, 1e6, "a locked one skips the ramp, with no boost beyond that");
         vm.assertEq(p.tollOf(locked), 100e18, "and would pay 10% to leave today");
         vm.assertEq(p.feeWad(), 0.003e18, "the fee it was opened with");
-        vm.assertEq(p.feePolicy().feeMinWad, 0.0012e18, "which may fall to 0.4 of that");
+        vm.assertEq(desk.policyOf(address(p)).feeMinWad, 0.0012e18, "which may fall to 0.4 of that");
         vm.prank(trader);
         p.swap(address(a), 10e18, 0, trader);
     }
@@ -386,20 +401,20 @@ contract V5PoolSettingsTest is PoolSetup {
     function test_theFeeFallsFastAndRisesSlowly() public {
         V5Pool p = _ready(_pool(0.5e18, type(uint256).max));
         vm.prank(alice);
-        vm.expectRevert(V5Pool.NotAllowed.selector);
-        p.queueFee(0.002e18);
+        vm.expectRevert(FeeDesk.NotAllowed.selector);
+        desk.queueFee(address(p), 0.002e18);
         vm.startPrank(feeSetter);
-        vm.expectRevert(EpochHall.BadConfig.selector);
-        p.queueFee(0.0005e18); // below the floor
-        vm.expectRevert(EpochHall.BadConfig.selector);
-        p.queueFee(0.004e18); // above the cap
+        vm.expectRevert(FeeDesk.BadPolicy.selector);
+        desk.queueFee(address(p), 0.0005e18); // below the floor
+        vm.expectRevert(FeeDesk.BadPolicy.selector);
+        desk.queueFee(address(p), 0.004e18); // above the cap
 
-        p.queueFee(0.002e18);
+        desk.queueFee(address(p), 0.002e18);
         vm.assertEq(p.feeWad(), 0.003e18, "not yet");
         _skip(1 days);
         vm.assertEq(p.feeWad(), 0.002e18, "a decrease lands in a day");
 
-        p.queueFee(0.003e18);
+        desk.queueFee(address(p), 0.003e18);
         _skip(13 days);
         vm.assertEq(p.feeWad(), 0.002e18, "an increase is still waiting after thirteen");
         _skip(1 days);
@@ -408,7 +423,7 @@ contract V5PoolSettingsTest is PoolSetup {
     }
 
     function test_theVenueCutSetsItselfFromThePoolsYield() public {
-        V5Pool.FeePolicy memory f = _feePolicy();
+        FeePolicy memory f = _feePolicy();
         f.autoCut = true;
         V5Pool busy = _ready(_pool(0.5e18, type(uint256).max, _hallConfig(), f));
         V5Pool quiet = _ready(_pool(0.5e18, type(uint256).max, _hallConfig(), f));
@@ -434,7 +449,7 @@ contract V5PoolSettingsTest is PoolSetup {
     }
 
     function test_aLockBudgetPaysLockersOutOfTheVenueCut() public {
-        V5Pool.FeePolicy memory f = _feePolicy();
+        FeePolicy memory f = _feePolicy();
         f.lockBudgetWad = 0.5e18;
         V5Pool p = _ready(_pool(0.5e18, type(uint256).max, _hallConfig(), f));
         _join(p, alice, 1000e18, 0);
@@ -464,10 +479,10 @@ contract V5PoolSettingsTest is PoolSetup {
         p.setHallConfig(h);
         vm.assertGt(tollBefore, 0, "there is a toll to compare");
         vm.assertEq(p.tollOf(open), tollBefore, "no change can raise the toll on a position already open");
-        p.setVenueCut(0.2e18);
+        desk.setVenueCut(address(p), 0.2e18);
         vm.assertEq(p.venueCutWad(), 0.2e18, "a flat cut can be set by hand");
 
-        V5Pool.Roles memory r = _roles();
+        Roles memory r = _roles();
         r.configurer = address(0);
         p.setRoles(r);
         vm.expectRevert(V5Pool.NotAllowed.selector);

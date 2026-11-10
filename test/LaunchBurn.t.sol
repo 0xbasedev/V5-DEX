@@ -5,6 +5,7 @@ import {Token} from "./Base.sol";
 import {EscrowSetup} from "./BankEscrow.t.sol";
 import {PretendFeed} from "./TuningFork.t.sol";
 import {V5Pool} from "../src/V5Pool.sol";
+import {PoolConfig} from "../src/PoolTypes.sol";
 import {BankEscrow} from "../src/BankEscrow.sol";
 import {ExchangeToken} from "../src/ExchangeToken.sol";
 import {BurnVault, IBurnable} from "../src/BurnVault.sol";
@@ -43,7 +44,7 @@ abstract contract LaunchSetup is EscrowSetup {
         burnVault = new BurnVault(IBurnable(address(token)), 30 days, vm.getBlockTimestamp() + 30 days);
         // A market for it: 100,000 of each, so one token costs one unit of the asset.
         market = new V5Pool(
-            V5Pool.PoolConfig(address(a), address(token), 0.5e18, EPOCH, 0.003e18, 0.1e18, type(uint256).max, 0),
+            PoolConfig(address(a), address(token), 0.5e18, EPOCH, 0.003e18, 0.1e18, type(uint256).max, 0, curve),
             _roles(),
             _hallConfig(),
             _feePolicy()
@@ -215,6 +216,38 @@ contract LaunchBurnTest is LaunchSetup {
         vm.expectRevert(V5Pool.TooLittle.selector);
         engine.buy(); // the pool would give less than the Engine's average allows
         vm.assertEq(a.balanceOf(address(engine)), 100e18, "nothing was spent");
+    }
+
+    function test_theAverageIsThePoolsOwnInAssetPerToken() public {
+        _launchToken();
+        _launchEngine(_engineSetup());
+        // Someone buys tokens: a token now costs about 1.2 of the asset, and stays there.
+        vm.prank(treasury);
+        market.swap(address(a), 10_000e18, 0, treasury);
+        _watchForAWindow();
+        vm.assertGt(engine.spot(), 1.2e18, "asset per token, not token per asset");
+        vm.assertApproxEqAbs(engine.average(), engine.spot(), 1e9, "a price that stood all window is the average");
+    }
+
+    function test_whoeverMarksTheRecordCannotLeanOnTheAverage() public {
+        _launchToken();
+        _launchEngine(_engineSetup());
+        _watchForAWindow();
+        uint256 honest = engine.average();
+        vm.assertApproxEqAbs(honest, 1e18, 1e9, "one for one, as the pool has stood");
+
+        // Push the price far up, take the Engine's reading at that moment, and put it back, all in one block.
+        vm.startPrank(treasury);
+        uint256 got = market.swap(address(a), 25_000e18, 0, treasury);
+        vm.assertGt(engine.spot(), 1.5e18, "the price at the moment of the reading");
+        engine.observe();
+        market.swap(address(token), got, 0, treasury);
+        vm.stopPrank();
+
+        vm.assertEq(engine.average(), honest, "the reading marked a time, not a price");
+        _watchForAWindow();
+        vm.assertApproxEqAbs(engine.average(), engine.spot(), 1e9, "and a window later the spike is nowhere in it");
+        vm.assertLt(engine.average(), 1.01e18, "only what the round trip cost in fees");
     }
 
     function test_withAnOutsidePriceTheEngineMeasuresAgainstIt() public {

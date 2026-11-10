@@ -2,12 +2,14 @@
 pragma solidity 0.8.28;
 
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {IPriceSource} from "./TuningFork.sol";
 
 interface IPoolForEngine {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function price() external view returns (uint256);
+    function logPriceSum() external view returns (int256);
     function swap(address tokenIn, uint256 amountIn, uint256 minOut, address to) external returns (uint256);
 }
 
@@ -31,16 +33,22 @@ interface ITokenForEngine {
 ///    predictable purchase exists to be traded against.
 ///  - It never pays more than a set premium over a reference price. The
 ///    reference is an outside source if there is one. Until the token has an
-///    outside market, the reference is the Engine's own average of the pool's
-///    price over a long window, and it will not buy until it has watched for a
-///    full window.
+///    outside market, the reference is the pool's average price over a long
+///    window, and the Engine will not buy until it has a full window behind it.
 ///  - It does nothing before its start time.
 ///
-/// Remaining weakness, stated: with no outside source the average is built
-/// from readings anyone may trigger, each taken at the price of that moment.
-/// Whoever alone triggers readings can lean on it. The premium limit, the
-/// small size of each buy and the long window bound the damage; a keeper that
-/// takes a reading every block removes most of it.
+/// The average comes from the pool's own price record, which only the pool's
+/// swaps write, each at the price it found before it traded. The Engine keeps
+/// markers of where that record stood at past moments; anyone may add one.
+/// Whoever adds them chooses when an average starts and nothing else: the
+/// prices in between are the pool's. It is the geometric average, which a
+/// short spike moves less than it would move a plain one.
+///
+/// Remaining weakness, stated: before the token trades anywhere else, the
+/// pool's price is the only price there is. Someone willing to hold the pool's
+/// price up for most of a window, against everyone free to sell into it, would
+/// raise the average. The premium limit and the small size of each buy bound
+/// what that could earn them.
 contract BuybackEngine {
     uint256 internal constant WAD = 1e18;
     /// How many checkpoints the average keeps per window.
@@ -67,12 +75,9 @@ contract BuybackEngine {
     uint256 public totalSpent;
     uint256 public totalBought;
 
-    // The Engine's own record of the pool's price, asset per token.
-    uint256 public lastPrice;
-    uint256 public lastSeen;
-    uint256 public cumulative;
+    // Markers: where the pool's price record stood, and when.
     uint64[] internal _checkTimes;
-    uint256[] internal _checkSums;
+    int256[] internal _checkSums;
 
     event Bought(uint256 spent, uint256 bought, uint256 referenceWad);
 
@@ -123,29 +128,24 @@ contract BuybackEngine {
         return _assetIsToken0 ? WAD * WAD / p : p;
     }
 
-    /// Take a reading of the pool's price for the Engine's average. Anyone may call.
+    /// Mark where the pool's price record stands, if the last marker is old
+    /// enough. Anyone may call; every buy does.
     function observe() public {
-        uint256 last = lastSeen;
-        if (block.timestamp == last) return;
-        if (last != 0) cumulative += lastPrice * (block.timestamp - last);
-        lastSeen = block.timestamp;
-        lastPrice = spot();
         uint256 n = _checkTimes.length;
-        if (n == 0 || block.timestamp - _checkTimes[n - 1] >= window / GRAIN) {
-            _checkTimes.push(uint64(block.timestamp));
-            _checkSums.push(cumulative);
-        }
+        if (n != 0 && block.timestamp - _checkTimes[n - 1] < window / GRAIN) return;
+        _checkTimes.push(uint64(block.timestamp));
+        _checkSums.push(pool.logPriceSum());
     }
 
-    /// The Engine's own average price over at least one full window.
+    /// The pool's average price over at least one full window, asset per token.
     function average() public view returns (uint256) {
         uint256 n = _checkTimes.length;
-        uint256 cutoff = block.timestamp - window;
-        // The newest checkpoint that is at least a window old.
-        while (n != 0 && _checkTimes[n - 1] > cutoff) --n;
+        // The newest marker that is at least a window old.
+        while (n != 0 && _checkTimes[n - 1] + window > block.timestamp) --n;
         if (n == 0) revert NotEnoughHistory();
-        uint256 sumNow = cumulative + lastPrice * (block.timestamp - lastSeen);
-        return (sumNow - _checkSums[n - 1]) / (block.timestamp - _checkTimes[n - 1]);
+        int256 meanLog = (pool.logPriceSum() - _checkSums[n - 1]) / int256(block.timestamp - _checkTimes[n - 1]);
+        // The record is of token1 per token0; the other way round is its negative.
+        return uint256(FixedPointMathLib.expWad(_assetIsToken0 ? -meanLog : meanLog));
     }
 
     /// The price the Engine measures a buy against.

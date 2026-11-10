@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Token} from "./Base.sol";
 import {PoolSetup} from "./V5Pool.t.sol";
 import {V5Pool} from "../src/V5Pool.sol";
+import {PoolConfig, Roles, FeePolicy} from "../src/PoolTypes.sol";
 import {EpochHall} from "../src/EpochHall.sol";
 import {TuningFork} from "../src/TuningFork.sol";
 import {DepegWatch} from "../src/DepegWatch.sol";
@@ -35,12 +36,12 @@ abstract contract ForkSetup is PoolSetup {
     }
 
     function _pegPool(address model) internal returns (V5Pool p) {
-        V5Pool.FeePolicy memory f = _feePolicy();
+        FeePolicy memory f = _feePolicy();
         f.feeMinWad = BASE * 4 / 10;
         f.feeMaxWad = BASE;
         f.feeModel = model;
         p = new V5Pool(
-            V5Pool.PoolConfig(address(a), address(b), 0.5e18, EPOCH, BASE, 0.1e18, type(uint256).max, 100),
+            PoolConfig(address(a), address(b), 0.5e18, EPOCH, BASE, 0.1e18, type(uint256).max, 100, curve),
             _roles(),
             _hallConfig(),
             f
@@ -243,7 +244,7 @@ contract DepegWatchTest is ForkSetup {
 
     function _poolWith(address depegWatch) internal returns (V5Pool p, uint256 locked) {
         p = _pegPool(address(0));
-        V5Pool.Roles memory r = _roles();
+        Roles memory r = _roles();
         r.depegWatch = depegWatch;
         vm.prank(configurer);
         p.setRoles(r);

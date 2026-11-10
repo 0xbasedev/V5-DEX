@@ -4,21 +4,20 @@ pragma solidity 0.8.28;
 import {EpochHall} from "./EpochHall.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
-import {StableMath} from "./StableMath.sol";
+import {PoolCurve, FEE_CEILING} from "./PoolCurve.sol";
+import {PoolConfig, Roles, Terms, FeePolicy} from "./PoolTypes.sol";
 
 interface IDecimals {
     function decimals() external view returns (uint8);
 }
 
-/// A fee that depends on where the trade takes the price. The pool hands it
-/// the fee in force and the pool's price before the trade, half way through
-/// it and after it, and charges whatever rate comes back, up to the ceiling.
-/// It is consulted on swaps only and can never stand in the way of an exit.
-interface IFeeModel {
-    function feeFor(uint256 baseFeeWad, uint256 priceBefore, uint256 priceMid, uint256 priceAfter)
+/// The fee desk, as the pool sees it.
+interface IFeeDesk {
+    function open(FeePolicy calldata f, uint256 feeWad, uint256 cutWad) external returns (uint256 reviewAt);
+    function reviewCut(uint256 cutWad, uint256 feeValue, uint256 elapsed, uint256 poolValue)
         external
         view
-        returns (uint256);
+        returns (uint256 cut, uint256 nextAt, uint256 grossAprWad);
 }
 
 /// Says whether an outside reference has been off its peg for long enough.
@@ -34,8 +33,14 @@ interface IDepegWatch {
 /// - Swap fees never enter the reserves. The LP share goes to the hall's fee
 ///   ledger and is paid by seasoned weight; the venue cut is set aside.
 /// - There is no fungible LP token. Joining opens a position in the hall.
-/// - The fee moves inside bounds, quickly downward and slowly upward.
-/// - The venue cut can set itself each week from the pool's own yield.
+/// - The swap arithmetic lives in `PoolCurve`, a contract that keeps nothing
+///   and that the pool only reads from.
+/// - The pool keeps its own record of its price, written by its own swaps,
+///   for anything that needs an average nobody else can lean on.
+/// - The pool holds the fee terms it charges by and reads them on every swap.
+///   The rules they are set by (bounds, delays, the weekly review of the venue
+///   cut) live in the `FeeDesk`, the only address that may set them, and the
+///   pool refuses any term above its own ceilings whoever asks.
 /// - A guardian can pause joins and swaps. A pause never blocks an exit, and
 ///   during one every exit is free of forfeits and tolls.
 ///
@@ -57,50 +62,16 @@ contract V5Pool is EpochHall {
     /// What each token's amounts are multiplied by to reach 18 decimals. Used by the amplified curve.
     uint256 internal immutable _scale0;
     uint256 internal immutable _scale1;
-
-    struct Roles {
-        address venue; // receives the venue cut
-        address pol; // receives protocol-owned liquidity credits
-        address guardian; // may pause and unpause
-        address capRaiser; // may raise the deposit cap
-        address configurer; // may change settings
-        address feeSetter; // may queue a fee change inside the bounds
-        address bank; // the escrow; may record what it has banked for this pool
-        address depegWatch; // optional; while it reports a depeg, exits are free
-    }
-
-    struct FeePolicy {
-        /// Bounds on the swap fee (WAD of the amount paid in).
-        uint256 feeMinWad;
-        uint256 feeMaxWad;
-        /// How long a decrease and an increase wait before taking effect, in seconds.
-        uint256 feeDownDelay;
-        uint256 feeUpDelay;
-        /// The venue cut sets itself: each review it aims to take `cutOfExcessWad`
-        /// of whatever the pool's fees yield above `referenceAprWad`.
-        bool autoCut;
-        uint256 cutOfExcessWad;
-        uint256 referenceAprWad;
-        /// Bounds on the venue cut (WAD of the fee), the most it moves per review, and seconds between reviews.
-        uint256 cutMinWad;
-        uint256 cutMaxWad;
-        uint256 cutStepWad;
-        uint256 cutReview;
-        /// Share of the venue cut paid to locked LPs (WAD).
-        uint256 lockBudgetWad;
-        /// An optional fee model, such as the tuning fork. Zero means the plain fee.
-        address feeModel;
-    }
+    /// Where the swap arithmetic is done. Read from, never written to.
+    PoolCurve public immutable curve;
 
     Roles internal _roles;
-    FeePolicy internal _feePolicy;
+    Terms internal _terms;
 
     /// A swap may bring in at most this share of the reserve it adds to.
     uint256 internal constant MAX_IN_RATIO = 0.3e18;
     /// Shares locked for good on the first join, so the pool can never be emptied to a rounding trap.
     uint256 internal constant DEAD_SHARES = 1000;
-    /// No fee policy may allow a fee above this.
-    uint256 internal constant FEE_CEILING = 0.1e18;
 
     uint256[2] public reserves;
     uint256 public totalShares;
@@ -109,16 +80,24 @@ contract V5Pool is EpochHall {
     uint256[2] public venueOwed;
     uint256[2] public polOwed;
 
-    uint256 internal _feeWad;
-    /// A fee change waiting out its delay, and when it takes effect (0 = none).
-    uint256 public queuedFeeWad;
-    uint256 public queuedFeeAt;
+    /// When the venue cut is next reviewed, when it last was, and the gross
+    /// fees since then valued in token0.
+    struct Review {
+        uint64 at;
+        uint64 last;
+        uint128 feeValue;
+    }
 
-    /// The venue's share of each fee (WAD).
-    uint256 public venueCutWad;
-    uint256 public lastCutReview;
-    /// Gross fees since the last review, valued in token0.
-    uint256 public feeValueSinceReview;
+    Review public review;
+
+    /// The price record: the natural logarithm of the price, times the
+    /// seconds it stood, summed since the pool opened, and the time it runs to.
+    struct Record {
+        int192 logSum;
+        uint64 at;
+    }
+
+    Record internal _record;
 
     bool public paused;
     /// Most of token0 the reserves may hold. Raise-only.
@@ -131,10 +110,9 @@ contract V5Pool is EpochHall {
     event Swapped(address indexed sender, address indexed tokenIn, uint256 amountIn, uint256 amountOut, uint256 fee);
     event PauseSet(bool paused);
     event CapRaised(uint256 cap);
-    event FeeQueued(uint256 feeWad, uint256 effectiveAt);
+    event TermsSet(Terms terms);
     event VenueCutSet(uint256 cutWad, uint256 grossAprWad);
-    event FeePolicySet(FeePolicy policy);
-    event ConfigurerSet(address configurer);
+    event RolesSet(Roles roles);
 
     error Paused();
     error Reentered();
@@ -144,25 +122,15 @@ contract V5Pool is EpochHall {
     error TooMuchIn();
     error OverCap();
 
-    struct PoolConfig {
-        address token0;
-        address token1;
-        uint256 weight0;
-        uint256 epochLength;
-        uint256 feeWad;
-        uint256 venueCutWad;
-        uint256 depositCap;
-        /// Zero for a weighted pool. For a peg pair, the amplification; weights must then be equal.
-        uint256 amp;
-    }
-
     constructor(PoolConfig memory c, Roles memory r, HallConfig memory h, FeePolicy memory f)
         EpochHall(c.epochLength, h)
     {
         if (
             c.token0 == c.token1 || c.token0 == address(0) || c.token1 == address(0) || c.weight0 == 0
-                || c.weight0 >= WAD || r.venue == address(0) || r.pol == address(0)
+                || c.weight0 >= WAD || r.venue == address(0) || r.pol == address(0) || c.curve.code.length == 0
+                || r.desk.code.length == 0 || c.feeWad > FEE_CEILING || c.venueCutWad > WAD || f.lockBudgetWad > WAD
         ) revert BadConfig();
+        curve = PoolCurve(c.curve);
         token0 = c.token0;
         token1 = c.token1;
         weight0 = c.weight0;
@@ -176,12 +144,10 @@ contract V5Pool is EpochHall {
             _scale1 = 10 ** (18 - d1);
         }
         _roles = r;
-        _setFeePolicy(f);
-        if (c.feeWad < f.feeMinWad || c.feeWad > f.feeMaxWad) revert BadConfig();
-        if (c.venueCutWad < f.cutMinWad || c.venueCutWad > f.cutMaxWad) revert BadConfig();
-        _feeWad = c.feeWad;
-        venueCutWad = c.venueCutWad;
-        lastCutReview = block.timestamp;
+        // The desk checks the policy and the opening fee and cut against it.
+        uint256 reviewAt = IFeeDesk(r.desk).open(f, c.feeWad, c.venueCutWad);
+        _terms = Terms(uint64(c.feeWad), 0, 0, uint64(c.venueCutWad), uint64(f.lockBudgetWad), f.feeModel);
+        review = Review(uint64(reviewAt), uint64(block.timestamp), 0);
         depositCap = c.depositCap;
     }
 
@@ -201,13 +167,19 @@ contract V5Pool is EpochHall {
         return _roles;
     }
 
-    function feePolicy() external view returns (FeePolicy memory) {
-        return _feePolicy;
+    function terms() external view returns (Terms memory) {
+        return _terms;
     }
 
-    /// The swap fee in force right now.
+    /// The swap fee in force right now. A change on its way lands by itself.
     function feeWad() public view returns (uint256) {
-        return queuedFeeAt != 0 && block.timestamp >= queuedFeeAt ? queuedFeeWad : _feeWad;
+        Terms storage t = _terms;
+        return t.nextFeeAt != 0 && block.timestamp >= t.nextFeeAt ? t.nextFeeWad : t.feeWad;
+    }
+
+    /// The venue's share of each fee (WAD).
+    function venueCutWad() external view returns (uint256) {
+        return _terms.venueCutWad;
     }
 
     // ------------------------------------------------------------------
@@ -232,6 +204,7 @@ contract V5Pool is EpochHall {
             if (shares <= DEAD_SHARES) revert TooLittle();
             shares -= DEAD_SHARES;
             total = DEAD_SHARES;
+            _record.at = uint64(block.timestamp); // the price exists from here
         } else {
             uint256 by0 = max0 * total / reserves[0];
             uint256 by1 = max1 * total / reserves[1];
@@ -353,7 +326,7 @@ contract V5Pool is EpochHall {
 
     /// What `amountIn` of `tokenIn` buys right now. The swap pays exactly this.
     function quote(address tokenIn, uint256 amountIn) external view returns (uint256 amountOut) {
-        (amountOut,) = _quote(_index(tokenIn), amountIn);
+        (amountOut,,) = _quote(_index(tokenIn), amountIn);
     }
 
     function swap(address tokenIn, uint256 amountIn, uint256 minOut, address to)
@@ -363,12 +336,22 @@ contract V5Pool is EpochHall {
     {
         if (paused) revert Paused();
         _current();
-        _reviewCutIfDue();
+        if (block.timestamp >= review.at) _reviewCut();
         uint256 i = _index(tokenIn);
         uint256 o = 1 - i;
         uint256 fee;
-        (amountOut, fee) = _quote(i, amountIn);
+        int256 logPrice;
+        (amountOut, fee, logPrice) = _quote(i, amountIn);
         if (amountOut == 0 || amountOut < minOut) revert TooLittle();
+
+        // The price this trade found has stood since the last trade. Write it
+        // into the record before moving it. Once a block is enough.
+        Record memory rec = _record;
+        if (block.timestamp > rec.at) {
+            rec.logSum += int192(logPrice * int256(block.timestamp - rec.at));
+            rec.at = uint64(block.timestamp);
+            _record = rec;
+        }
 
         _takeFee(i, fee);
         reserves[i] += amountIn - fee;
@@ -382,10 +365,11 @@ contract V5Pool is EpochHall {
     /// Split a fee. It never touches the reserves.
     function _takeFee(uint256 i, uint256 fee) private {
         // Remember what the pool has earned, in token0, for the next review of the cut.
-        feeValueSinceReview += i == 0 ? fee : _inToken0(fee);
+        uint256 value = review.feeValue + (i == 0 ? fee : _inToken0(fee));
+        review.feeValue = value > type(uint128).max ? type(uint128).max : uint128(value);
 
-        uint256 toVenue = fee * venueCutWad / WAD;
-        uint256 toLockers = toVenue * _feePolicy.lockBudgetWad / WAD;
+        uint256 toVenue = fee * _terms.venueCutWad / WAD;
+        uint256 toLockers = toVenue * _terms.lockBudgetWad / WAD;
         uint256 toLps = fee - toVenue;
         if (toLockers != 0) {
             // Paid to locked LPs if there are any; otherwise to every LP.
@@ -410,59 +394,42 @@ contract V5Pool is EpochHall {
         revert UnknownToken();
     }
 
-    function _quote(uint256 i, uint256 amountIn) private view returns (uint256 amountOut, uint256 fee) {
-        if (amountIn > reserves[i].mulWad(MAX_IN_RATIO)) revert TooMuchIn();
-        uint256 rate = feeWad();
-        address model = _feePolicy.feeModel;
-        if (model != address(0)) {
-            // Where the trade would take the price, measured without the fee.
-            uint256 half = amountIn / 2;
-            rate = IFeeModel(model)
-                .feeFor(
-                    rate,
-                    _price(i, 0, 0),
-                    _price(i, half, _curveOut(i, half)),
-                    _price(i, amountIn, _curveOut(i, amountIn))
-                );
-            if (rate > FEE_CEILING) rate = FEE_CEILING;
+    function _shape() private view returns (PoolCurve.Shape memory) {
+        return PoolCurve.Shape(weight0, amp, _scale0, _scale1);
+    }
+
+    function _quote(uint256 i, uint256 amountIn)
+        private
+        view
+        returns (uint256 amountOut, uint256 fee, int256 logPrice)
+    {
+        if (amountIn > reserves[i].mulWad(MAX_IN_RATIO)) {
+            revert TooMuchIn();
         }
-        fee = amountIn.mulWadUp(rate);
-        amountOut = _curveOut(i, amountIn - fee);
+        return curve.quote(_shape(), reserves[0], reserves[1], i, amountIn, feeWad(), _terms.feeModel);
     }
 
-    /// What `net` of token `i` buys from the curve, before any fee. Rounded against the trader.
-    function _curveOut(uint256 i, uint256 net) private view returns (uint256 amountOut) {
-        uint256 rIn = reserves[i];
-        uint256 rOut = reserves[1 - i];
-        (uint256 wIn, uint256 wOut) = i == 0 ? (weight0, weight1) : (weight1, weight0);
-        if (amp != 0) {
-            // The amplified curve works in a common 18-decimal scale.
-            (uint256 sIn, uint256 sOut) = i == 0 ? (_scale0, _scale1) : (_scale1, _scale0);
-            amountOut = StableMath.amountOut(rIn * sIn, rOut * sOut, net * sIn, amp) / sOut;
-        } else if (wIn == wOut) {
-            amountOut = rOut * net / (rIn + net);
-        } else {
-            // out = rOut * (1 - (rIn / (rIn + net)) ^ (wIn / wOut)), rounded against the trader.
-            uint256 base = rIn.divWadUp(rIn + net);
-            uint256 power = uint256(FixedPointMathLib.powWad(int256(base), int256(wIn.divWad(wOut))));
-            power += power / 1e14 + 1; // more than the power function's error
-            amountOut = power >= WAD ? 0 : rOut.mulWad(WAD - power);
-        }
+    /// The pool's price now: token1 per token0, scaled by 1e18. A peg pair's
+    /// price is in a common 18-decimal scale, so it reads 1e18 at the peg.
+    function price() external view returns (uint256 p) {
+        (p,) = curve.spot(_shape(), reserves[0], reserves[1]);
     }
 
-    /// The pool's price, token1 per token0 scaled by 1e18, as it would stand
-    /// after `added` of token `i` came in and `removed` of the other went out.
-    /// A peg pair's price is in a common 18-decimal scale, so it reads 1e18 at the peg.
-    function _price(uint256 i, uint256 added, uint256 removed) private view returns (uint256) {
-        (uint256 r0, uint256 r1) =
-            i == 0 ? (reserves[0] + added, reserves[1] - removed) : (reserves[0] - removed, reserves[1] + added);
-        if (amp != 0) return StableMath.price(r0 * _scale0, r1 * _scale1, amp);
-        return FixedPointMathLib.fullMulDiv(r1 * weight0, WAD, r0 * weight1);
-    }
-
-    /// The pool's price now: token1 per token0, scaled by 1e18.
-    function price() external view returns (uint256) {
-        return _price(0, 0, 0);
+    /// The pool's price record, brought up to this moment: the natural
+    /// logarithm of the price (token1 per token0, scaled by 1e18) times the
+    /// seconds it stood, summed since the pool opened.
+    ///
+    /// Take two readings some time apart; their difference divided by the
+    /// seconds between them is the logarithm of the average price over that
+    /// time, and its negative is the logarithm of the average the other way
+    /// round. Only the pool's own swaps write the record, each at the price it
+    /// found before it traded, so whoever takes the readings chooses when the
+    /// average starts and ends and nothing else.
+    function logPriceSum() external view returns (int256) {
+        Record memory rec = _record;
+        if (rec.at == 0) return 0;
+        (, int256 logPrice) = curve.spot(_shape(), reserves[0], reserves[1]);
+        return rec.logSum + logPrice * int256(block.timestamp - rec.at);
     }
 
     /// True while the depeg watch, if there is one, reports a depeg. A watch
@@ -478,54 +445,48 @@ contract V5Pool is EpochHall {
     }
 
     // ------------------------------------------------------------------
-    // The fee
+    // The fee terms
     // ------------------------------------------------------------------
 
-    /// Ask for a new swap fee, inside the bounds. A decrease takes effect after
-    /// the short delay and an increase after the long one.
-    function queueFee(uint256 newFeeWad) external only(_roles.feeSetter) {
-        FeePolicy memory f = _feePolicy;
-        if (newFeeWad < f.feeMinWad || newFeeWad > f.feeMaxWad) revert BadConfig();
-        uint256 current = feeWad();
-        _feeWad = current; // a change that had already matured is now simply the fee
-        queuedFeeWad = newFeeWad;
-        queuedFeeAt = block.timestamp + (newFeeWad < current ? f.feeDownDelay : f.feeUpDelay);
-        emit FeeQueued(newFeeWad, queuedFeeAt);
+    /// Set the terms the pool charges by, and when the venue cut is next
+    /// reviewed. Only the desk may, and only inside the pool's own ceilings.
+    function setTerms(Terms calldata t, uint256 reviewAt) external only(_roles.desk) {
+        if (
+            t.feeWad > FEE_CEILING || t.nextFeeWad > FEE_CEILING || t.venueCutWad > WAD || t.lockBudgetWad > WAD
+                || reviewAt > type(uint64).max
+        ) revert BadConfig();
+        _terms = t;
+        review.at = uint64(reviewAt);
+        emit TermsSet(t);
     }
-
-    // ------------------------------------------------------------------
-    // The venue cut
-    // ------------------------------------------------------------------
 
     /// Review the venue cut if a review is due. Anyone may call; swaps do it themselves.
     function reviewCut() external {
-        _reviewCutIfDue();
+        if (block.timestamp >= review.at) _reviewCut();
     }
 
-    function _reviewCutIfDue() private {
-        FeePolicy memory f = _feePolicy;
-        uint256 elapsed = block.timestamp - lastCutReview;
-        if (!f.autoCut || elapsed < f.cutReview || reserves[0] == 0) return;
-
-        // What the pool's fees yielded on its own depth since the last review,
-        // as a yearly rate. Both sides are valued in token0.
+    /// Ask the desk what the venue cut should be now. A desk that fails to
+    /// answer, or answers with more than the whole, changes nothing and is
+    /// asked again in a day. It can never stop a swap.
+    function _reviewCut() private {
+        Review memory rv = review;
+        // Both sides are valued in token0.
         uint256 poolValue = amp != 0 ? reserves[0] + _inToken0(reserves[1]) : reserves[0].divWad(weight0);
-        uint256 grossApr = feeValueSinceReview.mulDiv(365 days * WAD, elapsed * poolValue);
-
-        // Take a set share of the yield above the reference rate, none of the yield below it.
-        uint256 want =
-            grossApr > f.referenceAprWad ? f.cutOfExcessWad.mulDiv(grossApr - f.referenceAprWad, grossApr) : 0;
-        if (want < f.cutMinWad) want = f.cutMinWad;
-        if (want > f.cutMaxWad) want = f.cutMaxWad;
-
-        uint256 cut = venueCutWad;
-        if (want > cut) cut = want - cut > f.cutStepWad ? cut + f.cutStepWad : want;
-        else cut = cut - want > f.cutStepWad ? cut - f.cutStepWad : want;
-
-        venueCutWad = cut;
-        lastCutReview = block.timestamp;
-        feeValueSinceReview = 0;
-        emit VenueCutSet(cut, grossApr);
+        try IFeeDesk(_roles.desk)
+            .reviewCut(_terms.venueCutWad, rv.feeValue, block.timestamp - rv.last, poolValue) returns (
+            uint256 cut, uint256 nextAt, uint256 grossAprWad
+        ) {
+            if (cut <= WAD && nextAt > block.timestamp) {
+                if (cut != _terms.venueCutWad) {
+                    _terms.venueCutWad = uint64(cut);
+                    emit VenueCutSet(cut, grossAprWad);
+                }
+                review =
+                    Review(nextAt > type(uint64).max ? type(uint64).max : uint64(nextAt), uint64(block.timestamp), 0);
+                return;
+            }
+        } catch {}
+        review.at = uint64(block.timestamp + 1 days);
     }
 
     // ------------------------------------------------------------------
@@ -580,37 +541,9 @@ contract V5Pool is EpochHall {
         _setHallConfig(c);
     }
 
-    /// Change the fee policy. The fee and the cut in force are pulled inside the new bounds.
-    function setFeePolicy(FeePolicy calldata f) external only(_roles.configurer) {
-        _feeWad = feeWad();
-        queuedFeeAt = 0;
-        _setFeePolicy(f);
-        if (_feeWad < f.feeMinWad) _feeWad = f.feeMinWad;
-        if (_feeWad > f.feeMaxWad) _feeWad = f.feeMaxWad;
-        if (venueCutWad < f.cutMinWad) venueCutWad = f.cutMinWad;
-        if (venueCutWad > f.cutMaxWad) venueCutWad = f.cutMaxWad;
-    }
-
-    /// Set the venue cut by hand, inside its bounds. Only while it is not setting itself.
-    function setVenueCut(uint256 cutWad) external only(_roles.configurer) {
-        FeePolicy memory f = _feePolicy;
-        if (f.autoCut || cutWad < f.cutMinWad || cutWad > f.cutMaxWad) revert BadConfig();
-        venueCutWad = cutWad;
-        emit VenueCutSet(cutWad, 0);
-    }
-
     function setRoles(Roles calldata r) external only(_roles.configurer) {
-        if (r.venue == address(0) || r.pol == address(0)) revert BadConfig();
+        if (r.venue == address(0) || r.pol == address(0) || r.desk.code.length == 0) revert BadConfig();
         _roles = r;
-        emit ConfigurerSet(r.configurer);
-    }
-
-    function _setFeePolicy(FeePolicy memory f) private {
-        if (
-            f.feeMinWad > f.feeMaxWad || f.feeMaxWad > FEE_CEILING || f.cutMinWad > f.cutMaxWad || f.cutMaxWad > WAD
-                || f.cutOfExcessWad > WAD || f.lockBudgetWad > WAD || (f.autoCut && f.cutReview == 0)
-        ) revert BadConfig();
-        _feePolicy = f;
-        emit FeePolicySet(f);
+        emit RolesSet(r);
     }
 }
