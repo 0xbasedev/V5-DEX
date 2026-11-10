@@ -1,0 +1,102 @@
+"""Run the V5 simulator.
+
+  python3 -m sim.run                       one scenario against a plain pool
+  python3 -m sim.run --set floor=0.6 --set horizon_days=14
+  python3 -m sim.run --sweep               floor x horizon grid, written to sim/out/sweep.csv
+  python3 -m sim.run --seeds 20            average over more random runs
+"""
+
+import argparse
+import csv
+import os
+from dataclasses import asdict, fields
+
+from .model import Params, average
+
+ROWS = [
+    ("Depth", None),
+    ("tvl_avg", "Average TVL ($)"),
+    ("tvl_end", "TVL at the end ($)"),
+    ("seasoned_share_pct", "TVL that is fully seasoned (%)"),
+    ("volume", "Volume ($)"),
+    ("Who gets in (% of capital offered)", None),
+    ("accepted_hot_pct", "Hot money, stays days"),
+    ("accepted_medium_pct", "Medium, stays weeks"),
+    ("accepted_long_pct", "Long, stays months"),
+    ("What LPs earned (APR %)", None),
+    ("apr_anchor", "Anchor tenants"),
+    ("apr_long", "Long"),
+    ("apr_medium", "Medium"),
+    ("apr_hot", "Hot"),
+    ("new_vs_mature_pct", "New dollar vs seasoned dollar, first horizon (%)"),
+    ("Venue ($)", None),
+    ("build", "Build fund"),
+    ("pol_value", "POL owned"),
+    ("pol_income", "Fees earned by POL"),
+    ("banked", "Banked for the launch burn"),
+    ("forfeited_fees", "Fees forfeited by early leavers"),
+]
+
+
+def fmt(key, v):
+    if v != v:
+        return "n/a"
+    return f"{v:,.1f}" if key.endswith("_pct") or key.startswith("apr_") else f"{v:,.0f}"
+
+
+def parse_sets(pairs):
+    types = {f.name: f.type for f in fields(Params)}
+    out = {}
+    for pair in pairs:
+        k, v = pair.split("=", 1)
+        if k not in types:
+            raise SystemExit(f"unknown parameter: {k}")
+        out[k] = int(v) if types[k] is int else float(v)
+    return out
+
+
+def scenario(p, seeds):
+    a, b = average(p, seeds), average(p.plain(), seeds)
+    print(f"V5: floor {p.floor}, horizon {p.horizon_days} days, {p.days} days, mean of {seeds} runs\n")
+    print(f"{'':50}{'V5':>14}{'Plain pool':>14}")
+    for key, label in ROWS:
+        if label is None:
+            print(f"\n{key}")
+        else:
+            print(f"  {label:48}{fmt(key, a[key]):>14}{fmt(key, b[key]):>14}")
+
+
+def sweep(p, seeds):
+    floors = [0.2, 0.4, 0.6, 0.8, 1.0]
+    horizons = [7, 14, 28, 56]
+    cols = ["tvl_avg", "seasoned_share_pct", "accepted_hot_pct", "accepted_long_pct",
+            "apr_long", "apr_hot", "new_vs_mature_pct", "venue_total"]
+    os.makedirs("sim/out", exist_ok=True)
+    path = "sim/out/sweep.csv"
+    print(f"{'floor':>6}{'days':>6}" + "".join(f"{c:>20}" for c in cols))
+    with open(path, "w", newline="") as fh:
+        writer = None
+        for floor in floors:
+            for horizon in horizons:
+                d = asdict(p)
+                d.update(floor=floor, horizon_days=horizon, u0=floor)
+                r = average(Params(**d), seeds)
+                row = dict(floor=floor, horizon_days=horizon, **r)
+                if writer is None:
+                    writer = csv.DictWriter(fh, fieldnames=list(row))
+                    writer.writeheader()
+                writer.writerow(row)
+                print(f"{floor:>6}{horizon:>6}" + "".join(f"{fmt(c, r[c]):>20}" for c in cols))
+    print(f"\nFull results: {path}  (u0 is set equal to floor in this grid; floor 1.0 is the plain pool)")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument("--set", action="append", default=[], metavar="name=value")
+    args = ap.parse_args()
+    d = asdict(Params())
+    d.update(parse_sets(args.set))
+    params = Params(**d)
+    (sweep if args.sweep else scenario)(params, args.seeds)
