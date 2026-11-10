@@ -44,6 +44,19 @@ contract HallHarness is EpochHall {
         return _collect(id);
     }
 
+    uint256[2] public compounded;
+
+    /// Token 0's unlocked fees become shares, one for one, in whole units.
+    function compound(uint256 id) external returns (uint256 added) {
+        _current();
+        Position storage p = _positions[id];
+        added = _available(p)[0] / 1e18 * 1e18;
+        if (added == 0) return 0;
+        _spend(p, 0, added);
+        compounded[0] += added;
+        _grow(p, added);
+    }
+
     function close(uint256 id, bool waived) external returns (uint256 shares, uint256 toll) {
         _current();
         (, shares, toll) = _close(id, waived);
@@ -265,6 +278,27 @@ contract EpochHallTest is Base {
         vm.assertEq(h.collect(late)[0], 0, "nothing to the one who locked afterwards");
     }
 
+    function test_compoundingGrowsAPositionWithoutTouchingItsAge() public {
+        uint256 id = hall.open(alice, 100e18, 0);
+        hall.open(bob, 100e18, 0);
+        hall.addFees(0, 64e18);
+        _nextEpoch();
+        _nextEpoch();
+        // Age 2 of 4: weight is 3/4 of shares, and 3/4 of the 32 earned is unlocked.
+        hall.poke(type(uint256).max);
+        vm.assertEq(hall.weightOf(id), 75e18, "weight before");
+        uint256 added = hall.compound(id);
+        vm.assertEq(added, 24e18, "the unlocked fees, in whole units");
+        vm.assertEq(hall.positionOf(id).shares, 124e18, "become shares");
+        vm.assertEq(hall.weightOf(id), 93e18, "at the same 3/4 weight: the age did not move");
+        vm.assertEq(hall.totalWeight(), 93e18 + 75e18, "and the hall's total follows");
+        _nextEpoch();
+        _nextEpoch();
+        hall.poke(type(uint256).max);
+        vm.assertEq(hall.weightOf(id), 124e18, "it matures on its original date, at its new size");
+        vm.assertEq(hall.compound(id), 8e18, "and the fees that were held can be compounded once they unlock");
+    }
+
     function test_hardTierUnavailableWhenSwitchedOff() public {
         vm.expectRevert(EpochHall.TierUnavailable.selector);
         hall.open(alice, 1e18, 1);
@@ -292,6 +326,7 @@ contract EpochHallTest is Base {
         uint256 base;
         uint256 perEpoch;
         uint256 earnedScaled; // WAD-scaled, never rounded
+        uint256 shares;
     }
 
     struct Run {
@@ -332,14 +367,24 @@ contract EpochHallTest is Base {
             if (x % 3 != 0 || r.n == 0) {
                 uint256 shares = (1 + (x >> 8) % 1000) * 1e18;
                 uint256 base = shares * r.floor / WAD;
-                r.refs[r.n] = Ref(true, r.h.open(alice, shares, 0), e, base, (shares - base) / r.horizon, 0);
+                r.refs[r.n] = Ref(true, r.h.open(alice, shares, 0), e, base, (shares - base) / r.horizon, 0, shares);
                 ++r.n;
                 continue;
             }
             Ref memory pos = r.refs[(x >> 8) % r.n];
             if (!pos.live) continue;
-            if (x % 2 == 0) {
+            uint256 choice = (x >> 4) % 3;
+            if (choice == 0) {
                 r.h.collect(pos.id);
+                continue;
+            }
+            if (choice == 1) {
+                // Compounding grows the position where it stands: same age, more weight.
+                uint256 added = r.h.compound(pos.id);
+                Ref memory grown = r.refs[(x >> 8) % r.n];
+                grown.base += grown.base * added / grown.shares;
+                grown.perEpoch += grown.perEpoch * added / grown.shares;
+                grown.shares += added;
                 continue;
             }
             // Leaving: check the hall against the slow sum, then hand back the forfeit.
@@ -377,7 +422,7 @@ contract EpochHallTest is Base {
             vm.assertLe(earned, r.refs[i].earnedScaled / WAD, "rounding is never in the position's favour");
             stillHeld += earned - r.h.positionOf(r.refs[i].id).paid[0];
         }
-        uint256 accounted = r.h.paidTo(alice, 0) + stillHeld + r.h.polGot(0) + r.h.pending(0);
+        uint256 accounted = r.h.paidTo(alice, 0) + stillHeld + r.h.polGot(0) + r.h.pending(0) + r.h.compounded(0);
         vm.assertLe(accounted, r.h.feesIn(0), "never pays out more than came in");
         vm.assertGe(accounted + 3000, r.h.feesIn(0), "and loses only dust");
     }

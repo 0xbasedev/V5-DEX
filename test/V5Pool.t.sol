@@ -215,6 +215,60 @@ contract V5PoolTest is PoolSetup {
         capped.join(600e18, 600e18, 0, 0, alice);
     }
 
+    function test_compoundingPutsUnlockedFeesBackAsLiquidity() public {
+        uint256 id = _join(alice, 1000e18, 0);
+        vm.startPrank(trader);
+        pool.swap(address(a), 100e18, 0, trader);
+        pool.swap(address(b), 100e18, 0, trader);
+        vm.stopPrank();
+        for (uint256 i; i < 4; ++i) {
+            _nextEpoch();
+        }
+
+        uint256 sharesBefore = pool.positionOf(id).shares;
+        uint256 r0 = pool.reserves(0);
+        uint256 held0 = pool.feesInHall(0);
+        vm.prank(alice);
+        uint256 added = pool.compound(id, 0);
+
+        vm.assertGt(added, 0, "shares were added");
+        vm.assertEq(pool.positionOf(id).shares, sharesBefore + added, "to the same position");
+        vm.assertApproxEqAbs(pool.weightOf(id), pool.positionOf(id).shares, 10, "which is still fully seasoned");
+        vm.assertLe(pool.weightOf(id), pool.positionOf(id).shares, "with rounding against the position");
+        vm.assertEq(pool.reserves(0) - r0, held0 - pool.feesInHall(0), "the fees moved from the hall into the reserves");
+        // Fees arrive in whatever mix traders paid them; what does not fit the pool's proportions stays collectable.
+        vm.prank(alice);
+        uint256[2] memory rest = pool.collect(id);
+        vm.assertTrue(rest[0] < 1e6 || rest[1] < 1e6, "one side was used up");
+    }
+
+    function test_onlyUnlockedFeesCanBeCompounded() public {
+        uint256 id = _join(alice, 1000e18, 0);
+        vm.startPrank(trader);
+        pool.swap(address(a), 100e18, 0, trader);
+        pool.swap(address(b), 100e18, 0, trader);
+        vm.stopPrank();
+        _nextEpoch(); // age 1 of 4: 5/8 unlocked, 3/8 still held
+
+        vm.prank(alice);
+        pool.compound(id, 0);
+        vm.assertGt(pool.feesInHall(0), 0.27e18 * 3 / 8 - 1e6, "the held fees are still in the hall");
+        vm.prank(bob);
+        vm.expectRevert(EpochHall.NotOwner.selector);
+        pool.compound(id, 0);
+    }
+
+    function test_donatedFeesArePaidLikeAnyOther() public {
+        uint256 id = _join(alice, 1000e18, 0);
+        vm.prank(bob);
+        pool.donate(8e18, 0);
+        for (uint256 i; i < 4; ++i) {
+            _nextEpoch();
+        }
+        vm.prank(alice);
+        vm.assertApproxEqAbs(pool.collect(id)[0], 8e18, 1e6, "the LP receives the donation by weight");
+    }
+
     function test_onlyTheOwnerCanExitOrCollect() public {
         uint256 id = _join(alice, 1000e18, 0);
         vm.startPrank(bob);
@@ -468,6 +522,20 @@ contract Handler is PoolSetup {
         if (owner == address(0)) return;
         vm.prank(owner);
         pool.exit(id, 0, 0, owner);
+    }
+
+    function compound(uint256 which) external {
+        if (ids.length == 0) return;
+        uint256 id = ids[which % ids.length];
+        address owner = pool.ownerOf(id);
+        if (owner == address(0)) return;
+        vm.prank(owner);
+        pool.compound(id, 0);
+    }
+
+    function donate(uint256 amount0, uint256 amount1) external {
+        vm.prank(trader);
+        pool.donate(bound(amount0, 0, 1e21), bound(amount1, 0, 1e21));
     }
 
     function pass(uint256 epochs) external {

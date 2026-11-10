@@ -21,8 +21,8 @@ pragma solidity 0.8.28;
 /// opened after it: each position carries the terms it was opened under. So
 /// no change can raise the cost of leaving for someone already in.
 ///
-/// First cut. Not here yet: compounding, deferred claims on the banked half,
-/// an ERC-721 surface. Not audited.
+/// First cut. Not here yet: deferred claims on the banked half, an ERC-721
+/// surface. Not audited.
 abstract contract EpochHall {
     uint256 internal constant WAD = 1e18;
     uint256 internal constant TOKENS = 2;
@@ -115,6 +115,7 @@ abstract contract EpochHall {
     event Forfeited(uint256 indexed id, uint256 amount0, uint256 amount1);
     event Moved(uint256 indexed id, address indexed from, address indexed to);
     event Merged(uint256 indexed a, uint256 indexed b, uint256 indexed into);
+    event Compounded(uint256 indexed id, uint256 used0, uint256 used1, uint256 shares);
 
     error NotOwner();
     error NoSuchPosition();
@@ -431,6 +432,36 @@ abstract contract EpochHall {
         if (lost[0] != 0 || lost[1] != 0) emit Forfeited(id, lost[0], lost[1]);
         emit Closed(id, owner, shares, tollShares);
         delete _positions[id];
+    }
+
+    /// What a position could take out now, token by token. Settles it first.
+    function _available(Position storage p) internal returns (uint256[2] memory out) {
+        _settle(p);
+        uint256 fraction = _unlockedFraction(p);
+        for (uint256 k; k < TOKENS; ++k) {
+            out[k] = p.earned[k] * fraction / WAD - p.paid[k] + p.tollOwed[k];
+        }
+    }
+
+    /// Mark `amount` of a position's available fees as used, without paying it out.
+    function _spend(Position storage p, uint256 k, uint256 amount) internal {
+        uint256 fromTolls = amount < p.tollOwed[k] ? amount : p.tollOwed[k];
+        p.tollOwed[k] -= fromTolls;
+        p.paid[k] += amount - fromTolls;
+    }
+
+    /// Add shares to a position at its current age: its weight grows in
+    /// proportion and its seasoning, its lock and its terms are untouched
+    /// (spec §18.9). Only for fees the hall itself has just released.
+    function _grow(Position storage p, uint256 added) internal {
+        _removeWeight(p);
+        uint256 shares = p.shares;
+        if (shares + added > type(uint128).max) revert BadConfig();
+        p.baseWeight += uint128(uint256(p.baseWeight) * added / shares);
+        p.weightPerEpoch += uint128(uint256(p.weightPerEpoch) * added / shares);
+        p.shares = uint128(shares + added);
+        if (p.tier == HARD) lockedShares += added;
+        _addWeight(p);
     }
 
     /// Share `amount` of fee token `k` among locked positions, by size. Returns

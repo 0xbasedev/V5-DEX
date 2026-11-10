@@ -252,6 +252,47 @@ contract V5Pool is EpochHall {
         feesInHall[k] += rest;
     }
 
+    /// Put a position's unlocked fees back into the pool as liquidity, at the
+    /// position's current age. Only fees the hall has released can be used, and
+    /// only as much as fits the pool's proportions; the rest stays collectable.
+    function compound(uint256 id, uint256 minShares) external guarded returns (uint256 shares) {
+        if (paused) revert Paused();
+        if (ownerOf(id) != msg.sender) revert NotOwner();
+        _current();
+        Position storage p = _positions[id];
+        uint256[2] memory have = _available(p);
+
+        uint256 total = totalShares;
+        uint256 by0 = have[0] * total / reserves[0];
+        uint256 by1 = have[1] * total / reserves[1];
+        shares = by0 < by1 ? by0 : by1;
+        if (shares == 0 || shares < minShares) revert TooLittle();
+        uint256 used0 = shares.mulDivUp(reserves[0], total);
+        uint256 used1 = shares.mulDivUp(reserves[1], total);
+
+        _spend(p, 0, used0);
+        _spend(p, 1, used1);
+        feesInHall[0] -= used0;
+        feesInHall[1] -= used1;
+        reserves[0] += used0;
+        reserves[1] += used1;
+        totalShares = total + shares;
+        _grow(p, shares);
+        emit Compounded(id, used0, used1, shares);
+    }
+
+    /// Add fees for the LPs from outside: the venue returning part of its cut,
+    /// a partner's incentive, anything. They are paid by seasoned weight like any other fee.
+    function donate(uint256 amount0, uint256 amount1) external guarded {
+        _current();
+        pending[0] += amount0;
+        pending[1] += amount1;
+        feesInHall[0] += amount0;
+        feesInHall[1] += amount1;
+        if (amount0 != 0) SafeTransferLib.safeTransferFrom(token0, msg.sender, address(this), amount0);
+        if (amount1 != 0) SafeTransferLib.safeTransferFrom(token1, msg.sender, address(this), amount1);
+    }
+
     /// Collect a position's unlocked fees.
     function collect(uint256 id) external guarded returns (uint256[2] memory) {
         if (ownerOf(id) != msg.sender) revert NotOwner();
