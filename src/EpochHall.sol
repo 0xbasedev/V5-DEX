@@ -369,8 +369,14 @@ abstract contract EpochHall {
 
     /// Open a position under today's settings. The books must be current.
     function _open(address owner, uint256 shares, uint8 tier) internal returns (uint256 id) {
+        return _openForTerm(owner, shares, tier, _hallConfig.lockTerm);
+    }
+
+    /// As `_open`, with the lock's length chosen by the caller instead of taken from the settings.
+    function _openForTerm(address owner, uint256 shares, uint8 tier, uint256 term) internal returns (uint256 id) {
         HallConfig memory c = _hallConfig;
-        if (tier > HARD || (tier == HARD && c.lockTerm == 0)) revert TierUnavailable();
+        c.lockTerm = term;
+        if (tier > HARD || (tier == HARD && c.lockTerm == 0) || term > MAX_EPOCHS) revert TierUnavailable();
         if (shares > type(uint128).max) revert BadConfig();
         id = nextPositionId++;
         Position storage p = _positions[id];
@@ -518,7 +524,7 @@ abstract contract EpochHall {
 
     /// Merge two of the caller's positions that are both fully seasoned and
     /// past any lock (spec §18.9). The result is an unlocked, mature position.
-    function merge(uint256 a, uint256 b) external returns (uint256 id) {
+    function merge(uint256 a, uint256 b) external virtual returns (uint256 id) {
         _current();
         Position storage pa = _positions[a];
         Position storage pb = _positions[b];

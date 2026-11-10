@@ -23,6 +23,8 @@ pnpm test:sim         # the simulator's own tests
 | `ExchangeToken.sol` | The token: fixed supply minted once, no owner, no mint, burnable. Its code is identical whatever its supply and chain. |
 | `BuybackEngine.sol` | Buys the token with the venue's stables, at most once a block and never above a reference price, and sends it to the Burn Vault. No admin, no settings. |
 | `BurnVault.sol` | Holds the token and burns it on burn day. No withdraw, no admin. |
+| `TokenLock.sol` | Locking the token for a share of fees and a vote. An Epoch Hall whose stake is the token: longer locks weigh more, leaving early costs less as the lock runs, and that cost is split between a burn and the lockers who stayed. |
+| `Gauges.sol` | Weekly votes by lockers direct a boost budget of real fees to pools, with a cap on any one pool. Bribes for votes, with decay. |
 | `HomeOutlet.sol` | The outlet on the home chain: passes escrow releases to the Engine. |
 | `Defaults.sol` | The settings a new pool, splitter, escrow, fork and depeg watch start with, each with the reason for it. |
 
@@ -81,7 +83,7 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 
 ## What the tests cover
 
-101 tests in `test/`, no test library needed.
+114 tests in `test/`, no test library needed.
 
 - **Against brute force.** Random opens, exits, collections and fees over 30 epochs, 512 runs. A slow calculation that walks every position every epoch must agree with the hall, the hall may never pay out more than came in, and rounding may never favour a position.
 - **The simulator's named cases**, with the same numbers: the early-exit forfeit, a transfer inside the horizon, a merge.
@@ -96,6 +98,8 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 - **The escrow**: per-pool ledgers and caps; no release without the published outlet, in its first epoch, or while another deploy waits; releases come from every pool in proportion; one member pauses, a threshold unpauses after a delay, a rogue member is removed at once but never while a deploy waits; both refund triggers; a pool that lies cannot take another pool's money; a stray transfer cannot dilute later depositors.
 - **Deferred claims with a real pool**: a late depositor gets only its share of the epochs it was in; a claim stays with the seller of a position and survives closing it; after a partial draw the rest is split by the same claims.
 - **The launch burn, end to end**: a banked fee travels escrow to outlet to Engine to Burn Vault and the supply falls, with the token, the Engine and the outlet each arriving through the timelocked deployer. The token's code is the same whatever its supply, name or chain, and it cannot mint. The Engine stops if the token is not the one it was built for or its supply is above the commitment; buys once a block and never before its start; will not buy into a price someone pushed up; and measures against an outside price when given one. The Burn Vault burns only on burn day and its meter counts only what was burned.
+- **The token lock**: a longer lock weighs and earns more; lengths are bounded; leaving early costs half on day one and a quarter half way, split between the burn and the stayers; with nobody else locked the whole cost is burned; a lock that has run leaves free, cannot vote, and can be closed by anyone for its owner; a lock can be sold and keeps its terms; locks cannot be merged.
+- **The gauges**: votes direct the budget to pools as fees for their LPs, capped per pool, with the remainder rolling on; a vote can be split and must add up; only listed pools, only the lock's owner, only a lock that outlasts the week; a bribe is shared by those who voted for the pool, reaches a voter who has since closed their lock, and decays to the buyback path if not collected.
 - **The council's invariants that can be tested on-chain**: a leaver never pays more than the rate written into the position; a pause never blocks an exit and makes it free; no setting can raise a toll on an open position.
 - **Four invariants under random use**: every token the pool holds is accounted for to the wei; every position can always leave; the escrow's ledger is always covered; and money leaves the escrow only to the outlet or as a refund.
 
@@ -131,6 +135,15 @@ On the launch burn:
 - **Everything the Engine buys is burned.** The spec also mentions paying some of it to seasoned LPs; that split is not built.
 - **The Burn Vault is deployed plainly, not through the timelocked deployer.** It has no admin and nothing to configure, and the Engine's published code names its address.
 
+On the token lock and the gauges:
+
+- **The token lock is an Epoch Hall**, as the spec's "one hall, two kinds of stake" suggests, but a separate instance from any pool's.
+- **Weight does not decay while a lock runs.** It is set by the length chosen and holds until the lock ends. A lock that has ended keeps earning until someone closes it, which anyone may do.
+- **One vote per lock per week, and it is final.** A lock must outlast the week it votes in, so the same tokens cannot vote, leave free and vote again.
+- **The cap on a pool's boost is a flat share of the week's budget.** The spec wants it to scale with the venue fees that pool produced, plus a flat slice for new pools. That needs a record of each pool's fees per week, which does not exist.
+- **Listing a pool is by hand.** The spec's age, depth and oracle checks are applied by whoever holds the configurer role.
+- **A bribe is paid to whoever cast the vote**, not to whoever holds the lock later.
+
 Where the escrow departs from spec v1.16, on purpose:
 
 9. **The cap is per pool, not per chain.** Anyone may bank for any pool, so one chain-wide cap could be filled by a stranger to push every real pool's share to its LPs instead.
@@ -146,7 +159,8 @@ Where the escrow departs from spec v1.16, on purpose:
 
 - The auto-compounding vault. Compounding itself is built, and uses only as much of each token as fits the pool's proportions; it does not swap the excess.
 - The outlet for chains other than home, which has to carry money across chains.
-- Locks on the token, gauges and bribes.
+- Moving protocol-owned liquidity by vote. The gauges record the votes; nothing acts on them for POL yet.
+- A fee line from the venue cut to the token lock and to the boost budget. Both accept payments from anyone; the splitter does not yet send them.
 - A router, and per-transaction permits.
 - A timelock in front of the configurer, and anything that moves the fee automatically.
 - An outside price source. The fork's pitch and the depeg watch both read one through a one-function interface; no adapter to a real oracle exists yet.
