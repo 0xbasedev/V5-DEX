@@ -20,6 +20,7 @@ abstract contract PoolSetup is Base {
 
     address configurer = address(0xC0F);
     address feeSetter = address(0xFEE5);
+    address bankRole; // the escrow, where a test uses one
 
     /// floor 1/2, horizon 4 epochs, half unlocked at once, 1/4 of forfeits and tolls to POL, 10-epoch lock at 10%.
     function _hallConfig() internal pure returns (EpochHall.HallConfig memory) {
@@ -34,7 +35,7 @@ abstract contract PoolSetup is Base {
     }
 
     function _roles() internal view returns (V5Pool.Roles memory) {
-        return V5Pool.Roles(venue, pol, guardian, capRaiser, configurer, feeSetter);
+        return V5Pool.Roles(venue, pol, guardian, capRaiser, configurer, feeSetter, bankRole);
     }
 
     function _pool(uint256 weight0, uint256 cap) internal returns (V5Pool) {
@@ -60,7 +61,7 @@ abstract contract PoolSetup is Base {
     }
 
     function _nextEpoch() internal {
-        vm.warp(block.timestamp + EPOCH);
+        _skip(EPOCH);
     }
 }
 
@@ -395,13 +396,13 @@ contract V5PoolSettingsTest is PoolSetup {
 
         p.queueFee(0.002e18);
         vm.assertEq(p.feeWad(), 0.003e18, "not yet");
-        vm.warp(block.timestamp + 1 days);
+        _skip(1 days);
         vm.assertEq(p.feeWad(), 0.002e18, "a decrease lands in a day");
 
         p.queueFee(0.003e18);
-        vm.warp(block.timestamp + 13 days);
+        _skip(13 days);
         vm.assertEq(p.feeWad(), 0.002e18, "an increase is still waiting after thirteen");
-        vm.warp(block.timestamp + 1 days);
+        _skip(1 days);
         vm.assertEq(p.feeWad(), 0.003e18, "and lands after fourteen");
         vm.stopPrank();
     }
@@ -421,13 +422,13 @@ contract V5PoolSettingsTest is PoolSetup {
             busy.swap(address(b), 50e18, 0, trader);
         }
         vm.stopPrank();
-        vm.warp(block.timestamp + 7 days);
+        _skip(7 days);
         busy.reviewCut();
         quiet.reviewCut();
         vm.assertEq(busy.venueCutWad(), 0.15e18, "the busy pool's cut steps up, one step at a time");
         vm.assertEq(quiet.venueCutWad(), 0.05e18, "the quiet pool's steps down to its floor");
 
-        vm.warp(block.timestamp + 6 days);
+        _skip(6 days);
         busy.reviewCut();
         vm.assertEq(busy.venueCutWad(), 0.15e18, "and nothing moves before the next review is due");
     }
@@ -539,7 +540,7 @@ contract Handler is PoolSetup {
     }
 
     function pass(uint256 epochs) external {
-        vm.warp(block.timestamp + bound(epochs, 1, 6) * EPOCH);
+        _skip(bound(epochs, 1, 6) * EPOCH);
     }
 
     function pause(bool on) external {

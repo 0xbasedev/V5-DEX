@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 /// The cheatcodes these tests use. Declared here so the suite needs no test library.
 interface Vm {
     function warp(uint256) external;
+    function getBlockTimestamp() external view returns (uint256);
     function prank(address) external;
     function startPrank(address) external;
     function stopPrank() external;
@@ -23,6 +24,13 @@ interface Vm {
 abstract contract Base {
     Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     uint256 internal constant WAD = 1e18;
+
+    /// Move the clock forward. The time is read through the cheatcode, not
+    /// from `block.timestamp`: the optimiser assumes the timestamp cannot
+    /// change inside one call, which a test that warps makes untrue.
+    function _skip(uint256 dt) internal {
+        vm.warp(vm.getBlockTimestamp() + dt);
+    }
 
     function bound(uint256 x, uint256 lo, uint256 hi) internal pure returns (uint256) {
         return lo + x % (hi - lo + 1);

@@ -38,6 +38,7 @@ contract V5Pool is EpochHall {
         address capRaiser; // may raise the deposit cap
         address configurer; // may change settings
         address feeSetter; // may queue a fee change inside the bounds
+        address bank; // the escrow; may record what it has banked for this pool
     }
 
     struct FeePolicy {
@@ -291,6 +292,12 @@ contract V5Pool is EpochHall {
         feesInHall[1] += amount1;
         if (amount0 != 0) SafeTransferLib.safeTransferFrom(token0, msg.sender, address(this), amount0);
         if (amount1 != 0) SafeTransferLib.safeTransferFrom(token1, msg.sender, address(this), amount1);
+    }
+
+    /// Called by the escrow when it banks part of this pool's venue cut.
+    function recordBanked(uint256 amount) external only(_roles.bank) {
+        _current();
+        _recordBanked(amount);
     }
 
     /// Collect a position's unlocked fees.

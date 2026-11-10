@@ -26,6 +26,12 @@ pragma solidity 0.8.28;
 abstract contract EpochHall {
     uint256 internal constant WAD = 1e18;
     uint256 internal constant TOKENS = 2;
+    /// The hall shares out three streams by seasoned weight: the two fee
+    /// tokens, and a third that is only a record of what was banked for the
+    /// launch burn. The third pays nothing here; it builds each wallet's claim
+    /// on a refund (spec §18.8).
+    uint256 internal constant STREAMS = 3;
+    uint256 internal constant BANK = 2;
     /// Horizon and lock term are capped so that epoch arithmetic fits its storage with room to spare.
     uint256 internal constant MAX_EPOCHS = 1 << 20;
 
@@ -80,8 +86,8 @@ abstract contract EpochHall {
     }
 
     struct Checkpoint {
-        uint256[2] a;
-        uint256[2] b;
+        uint256[3] a;
+        uint256[3] b;
     }
 
     mapping(uint256 => Position) internal _positions;
@@ -95,15 +101,22 @@ abstract contract EpochHall {
     /// Slope that stops at a given epoch, because positions mature there.
     mapping(uint256 => uint256) public slopeEnding;
 
-    /// Fees that arrived during the current epoch, per token.
-    uint256[2] public pending;
+    /// What arrived during the current epoch: fees per token, then the amount banked.
+    uint256[3] public pending;
+
+    /// Everything ever recorded as banked for this pool, in the bank's asset.
+    uint256 public bankTotal;
+    /// Each wallet's share of `bankTotal`, earned by seasoned weight in the
+    /// epochs it was banked. It stays with the wallet that earned it: selling
+    /// or closing a position does not move it.
+    mapping(address => uint256) public claimWeight;
 
     /// Shares held in the hard tier, and what has been paid to them per share (WAD-scaled).
     uint256 public lockedShares;
     uint256[2] internal _tollPerLockedShare;
 
-    uint256[2] internal _a;
-    uint256[2] internal _b;
+    uint256[3] internal _a;
+    uint256[3] internal _b;
     /// Epochs at which the running sums changed, and their values from then on.
     uint64[] internal _checkpointEpochs;
     mapping(uint256 => Checkpoint) internal _checkpoints;
@@ -174,7 +187,7 @@ abstract contract EpochHall {
         // Fees that arrived in epoch `e` are shared by the weights of epoch `e`.
         if (weight != 0) {
             bool changed;
-            for (uint256 k; k < TOKENS; ++k) {
+            for (uint256 k; k < STREAMS; ++k) {
                 uint256 amount = pending[k];
                 if (amount == 0) continue;
                 uint256 perWeight = amount * WAD / weight;
@@ -329,6 +342,8 @@ abstract contract EpochHall {
                 p.tollMark[k] = _tollPerLockedShare[k];
             }
         }
+        // The claim goes to whoever owns the position now, for the epochs since it was last settled.
+        if (p.settledTo != e) claimWeight[p.owner] += _span(p, p.settledTo, e, BANK);
         p.settledTo = e;
     }
 
@@ -462,6 +477,22 @@ abstract contract EpochHall {
         p.shares = uint128(shares + added);
         if (p.tier == HARD) lockedShares += added;
         _addWeight(p);
+    }
+
+    /// Record `amount` as banked in this epoch. Whoever holds seasoned weight
+    /// when the epoch closes earns a claim on it.
+    function _recordBanked(uint256 amount) internal {
+        pending[BANK] += amount;
+        bankTotal += amount;
+    }
+
+    /// Bring positions' claims up to date. Anyone may call it for anyone.
+    function settleClaims(uint256[] calldata ids) external {
+        _current();
+        for (uint256 i; i < ids.length; ++i) {
+            Position storage p = _positions[ids[i]];
+            if (p.owner != address(0)) _settle(p);
+        }
     }
 
     /// Share `amount` of fee token `k` among locked positions, by size. Returns

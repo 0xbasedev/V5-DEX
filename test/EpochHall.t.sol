@@ -105,7 +105,7 @@ contract EpochHallTest is Base {
     }
 
     function _nextEpoch() internal {
-        vm.warp(block.timestamp + EPOCH);
+        _skip(EPOCH);
     }
 
     /// sim/test_hall.py: test_early_exit_forfeit_goes_to_pol_and_seasoned_weight
@@ -307,7 +307,7 @@ contract EpochHallTest is Base {
     function test_idlePoolCatchesUpInSteps() public {
         uint256 id = hall.open(alice, 100e18, 0);
         hall.addFees(0, 10e18);
-        vm.warp(block.timestamp + 1000 * EPOCH);
+        _skip(1000 * EPOCH);
         hall.poke(300);
         vm.assertEq(hall.epoch(), 300, "bounded work per call");
         hall.poke(type(uint256).max);

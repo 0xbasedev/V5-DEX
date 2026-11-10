@@ -2,30 +2,14 @@
 pragma solidity 0.8.28;
 
 import {Token} from "./Base.sol";
-import {PoolSetup} from "./V5Pool.t.sol";
+import {EscrowSetup} from "./BankEscrow.t.sol";
 import {V5Pool} from "../src/V5Pool.sol";
-import {EpochHall} from "../src/EpochHall.sol";
-import {VenueSplitter, IV5PoolForSplitter} from "../src/VenueSplitter.sol";
+import {VenueSplitter} from "../src/VenueSplitter.sol";
 import {Defaults} from "../src/Defaults.sol";
 
-contract VenueSplitterTest is PoolSetup {
-    V5Pool pool;
-    VenueSplitter splitter;
-    address build = address(0xB111D);
-    address prize = address(0x9121E);
-    address bank = address(0xBA4C);
-
+contract VenueSplitterTest is EscrowSetup {
     function setUp() public {
-        a = new Token("A");
-        b = new Token("B");
-        pool = _pool(0.5e18, type(uint256).max);
-        splitter =
-            new VenueSplitter(IV5PoolForSplitter(address(pool)), Defaults.lines(build, pol, prize, bank), configurer);
-        // Point the pool's venue at the splitter.
-        V5Pool.Roles memory r = _roles();
-        r.venue = address(splitter);
-        vm.prank(configurer);
-        pool.setRoles(r);
+        _deployAll(1000e18);
         _fund(alice, pool);
         _fund(trader, pool);
     }
@@ -40,8 +24,9 @@ contract VenueSplitterTest is PoolSetup {
         vm.assertEq(a.balanceOf(build), 0.012e18, "40% to the build fund");
         vm.assertEq(a.balanceOf(pol), 0.006e18, "20% to protocol-owned liquidity");
         vm.assertEq(a.balanceOf(prize), 0.003e18, "10% to prizes");
-        vm.assertEq(a.balanceOf(bank), 0.0045e18, "half the buyback line is banked");
-        vm.assertEq(splitter.returnedToLps(0), 0.0045e18, "and half goes back to the pool's LPs");
+        vm.assertEq(escrow.ledgerOf(address(pool)), 0.0045e18, "half the buyback line is banked in the escrow");
+        vm.assertEq(pool.bankTotal(), 0.0045e18, "and the pool's hall has recorded it");
+        vm.assertEq(splitter.returnedToLps(0), 0.0045e18, "the other half goes back to the pool's LPs");
         vm.assertEq(a.balanceOf(address(splitter)), 0, "nothing is left behind");
 
         // The LP ends up with the LP share of the fee plus the half returned.
@@ -52,9 +37,57 @@ contract VenueSplitterTest is PoolSetup {
         vm.assertApproxEqAbs(pool.collect(id)[0], 0.27e18 + 0.0045e18, 1e6, "paid by seasoned weight like any fee");
     }
 
+    function test_bankedMoneyInTheOtherTokenWaitsForTheConverter() public {
+        vm.prank(alice);
+        pool.join(1000e18, 1000e18, 0, 0, alice);
+        vm.prank(trader);
+        pool.swap(address(b), 100e18, 0, trader); // this fee is paid in the token the escrow does not take
+
+        splitter.distribute();
+        vm.assertEq(splitter.waiting(1), 0.0045e18, "the banked share waits in the splitter");
+        vm.assertEq(escrow.ledgerOf(address(pool)), 0, "and nothing is in the escrow yet");
+
+        vm.prank(alice);
+        vm.expectRevert(VenueSplitter.NotAllowed.selector);
+        splitter.convert(0);
+        uint256 expected = pool.quote(address(b), 0.0045e18);
+        vm.prank(converter);
+        uint256 out = splitter.convert(expected);
+        vm.assertEq(out, expected, "the converter swaps it at no worse than the minimum it set");
+        vm.assertEq(splitter.waiting(1), 0, "nothing is left waiting");
+        vm.assertEq(escrow.ledgerOf(address(pool)), out, "and it is banked");
+    }
+
+    function test_whatDoesNotFitUnderTheCapGoesToTheLps() public {
+        // A cap so small that only part of the banked share fits.
+        _deployAll(0.001e18);
+        _fund(alice, pool);
+        _fund(trader, pool);
+        vm.prank(alice);
+        pool.join(1000e18, 1000e18, 0, 0, alice);
+        vm.prank(trader);
+        pool.swap(address(a), 100e18, 0, trader);
+        splitter.distribute();
+        vm.assertEq(escrow.ledgerOf(address(pool)), 0.001e18, "the escrow takes up to the cap");
+        vm.assertEq(splitter.returnedToLps(0), 0.0045e18 + 0.0035e18, "and the LPs get their half plus the overflow");
+        vm.assertEq(escrow.room(address(pool)), 0, "the cap is reached");
+    }
+
+    function test_withNoEscrowTheWholeBuybackLineGoesToTheLps() public {
+        VenueSplitter.Lines memory l = Defaults.lines(build, pol, prize, address(0), converter);
+        vm.prank(configurer);
+        splitter.setLines(l);
+        vm.prank(alice);
+        pool.join(1000e18, 1000e18, 0, 0, alice);
+        vm.prank(trader);
+        pool.swap(address(a), 100e18, 0, trader);
+        splitter.distribute();
+        vm.assertEq(splitter.returnedToLps(0), 0.009e18, "all 30% of the cut");
+    }
+
     function test_linesAreSettingsAndMustAddUp() public {
-        VenueSplitter.Lines memory l = Defaults.lines(build, pol, prize, bank);
-        l.buybackToLpsWad = 1e18; // everything on the buyback line to LPs, nothing banked
+        VenueSplitter.Lines memory l = Defaults.lines(build, pol, prize, address(escrow), converter);
+        l.buybackToLpsWad = 1e18;
         vm.prank(alice);
         vm.expectRevert(VenueSplitter.NotAllowed.selector);
         splitter.setLines(l);

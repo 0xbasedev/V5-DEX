@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {EpochHall} from "./EpochHall.sol";
 import {V5Pool} from "./V5Pool.sol";
 import {VenueSplitter} from "./VenueSplitter.sol";
+import {BankEscrow} from "./BankEscrow.sol";
 
 /// @title Defaults
 /// @notice The settings a new V5 pool starts with.
@@ -71,7 +72,7 @@ library Defaults {
     /// and were never swept; the remaining 30% is the buyback line. Before the
     /// token exists, half of that line goes back to the pool's LPs and half is
     /// banked for the launch burn (ruled: 50/50).
-    function lines(address build, address pol, address prize, address bank)
+    function lines(address build, address pol, address prize, address bank, address converter)
         internal
         pure
         returns (VenueSplitter.Lines memory l)
@@ -84,7 +85,26 @@ library Defaults {
         l.pol = pol;
         l.prize = prize;
         l.bank = bank;
+        l.converter = converter;
     }
+
+    /// The escrow's limits. None of these numbers comes from a simulator run:
+    /// the simulator does not model the escrow's release, pause or refund.
+    /// They are starting points chosen to respect the one hard rule, that a
+    /// stuck pause must outlast a deploy delay plus an unpause.
+    ///
+    /// `deployDelay` is the timelocked deployer's delay.
+    function escrowLimits(uint256 poolCap, uint256 deployDelay) internal pure returns (BankEscrow.Limits memory l) {
+        l.poolCap = poolCap; // per pool, in the escrow's asset; no safe default
+        l.releaseRateWad = 0.01e18; // 1% of the ledger per epoch: half is gone in about 17 days
+        l.unpauseDelay = 3 days;
+        l.stuckPeriod = deployDelay + l.unpauseDelay + 14 days;
+        l.threshold = 3;
+        l.memberFloor = 3;
+    }
+
+    /// The longest timelock: how long a queued deploy waits. Not from a run.
+    uint256 internal constant DEPLOY_DELAY = 14 days;
 
     /// The venue cut a pool opens with, before its first weekly review.
     uint256 internal constant OPENING_CUT = 0.1e18;
