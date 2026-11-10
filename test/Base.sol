@@ -39,7 +39,12 @@ abstract contract Base {
 
 contract Token {
     string public name;
-    uint8 public constant decimals = 18;
+    uint8 public decimals = 18;
+
+    function setDecimals(uint8 d) external {
+        decimals = d;
+    }
+
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 

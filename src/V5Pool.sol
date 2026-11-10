@@ -4,10 +4,16 @@ pragma solidity 0.8.28;
 import {EpochHall} from "./EpochHall.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
+import {StableMath} from "./StableMath.sol";
+
+interface IDecimals {
+    function decimals() external view returns (uint8);
+}
 
 /// @title V5Pool
-/// @notice A two-token weighted pool whose liquidity is held as seasoned
-/// positions (spec v1.16 §3).
+/// @notice A two-token pool whose liquidity is held as seasoned positions
+/// (spec v1.16 §3). The curve is weighted for general pairs, or amplified for
+/// peg pairs; everything else is the same in both.
 ///
 /// - Swap fees never enter the reserves. The LP share goes to the hall's fee
 ///   ledger and is paid by seasoned weight; the venue cut is set aside.
@@ -30,6 +36,11 @@ contract V5Pool is EpochHall {
     /// Weights, in WAD, summing to one.
     uint256 public immutable weight0;
     uint256 public immutable weight1;
+    /// Amplification for a peg pair. Zero means the weighted curve.
+    uint256 public immutable amp;
+    /// What each token's amounts are multiplied by to reach 18 decimals. Used by the amplified curve.
+    uint256 internal immutable _scale0;
+    uint256 internal immutable _scale1;
 
     struct Roles {
         address venue; // receives the venue cut
@@ -122,6 +133,8 @@ contract V5Pool is EpochHall {
         uint256 feeWad;
         uint256 venueCutWad;
         uint256 depositCap;
+        /// Zero for a weighted pool. For a peg pair, the amplification; weights must then be equal.
+        uint256 amp;
     }
 
     constructor(PoolConfig memory c, Roles memory r, HallConfig memory h, FeePolicy memory f)
@@ -135,6 +148,14 @@ contract V5Pool is EpochHall {
         token1 = c.token1;
         weight0 = c.weight0;
         weight1 = WAD - c.weight0;
+        amp = c.amp;
+        if (c.amp != 0) {
+            uint256 d0 = IDecimals(c.token0).decimals();
+            uint256 d1 = IDecimals(c.token1).decimals();
+            if (c.weight0 != WAD / 2 || c.amp > 100_000 || d0 > 18 || d1 > 18) revert BadConfig();
+            _scale0 = 10 ** (18 - d0);
+            _scale1 = 10 ** (18 - d1);
+        }
         _roles = r;
         _setFeePolicy(f);
         if (c.feeWad < f.feeMinWad || c.feeWad > f.feeMaxWad) revert BadConfig();
@@ -342,7 +363,7 @@ contract V5Pool is EpochHall {
     /// Split a fee. It never touches the reserves.
     function _takeFee(uint256 i, uint256 fee) private {
         // Remember what the pool has earned, in token0, for the next review of the cut.
-        feeValueSinceReview += i == 0 ? fee : fee.mulDiv(reserves[0] * weight1, reserves[1] * weight0);
+        feeValueSinceReview += i == 0 ? fee : _inToken0(fee);
 
         uint256 toVenue = fee * venueCutWad / WAD;
         uint256 toLockers = toVenue * _feePolicy.lockBudgetWad / WAD;
@@ -358,6 +379,12 @@ contract V5Pool is EpochHall {
         feesInHall[i] += toLps;
     }
 
+    /// An amount of token1 valued in token0: at the peg for a peg pair, at the pool's price otherwise.
+    function _inToken0(uint256 amount1) private view returns (uint256) {
+        if (amp != 0) return amount1 * _scale1 / _scale0;
+        return amount1.mulDiv(reserves[0] * weight1, reserves[1] * weight0);
+    }
+
     function _index(address token) private view returns (uint256) {
         if (token == token0) return 0;
         if (token == token1) return 1;
@@ -371,7 +398,11 @@ contract V5Pool is EpochHall {
         uint256 rOut = reserves[1 - i];
         if (net > rIn.mulWad(MAX_IN_RATIO)) revert TooMuchIn();
         (uint256 wIn, uint256 wOut) = i == 0 ? (weight0, weight1) : (weight1, weight0);
-        if (wIn == wOut) {
+        if (amp != 0) {
+            // The amplified curve works in a common 18-decimal scale.
+            (uint256 sIn, uint256 sOut) = i == 0 ? (_scale0, _scale1) : (_scale1, _scale0);
+            amountOut = StableMath.amountOut(rIn * sIn, rOut * sOut, net * sIn, amp) / sOut;
+        } else if (wIn == wOut) {
             amountOut = rOut * net / (rIn + net);
         } else {
             // out = rOut * (1 - (rIn / (rIn + net)) ^ (wIn / wOut)), rounded against the trader.
@@ -414,7 +445,7 @@ contract V5Pool is EpochHall {
 
         // What the pool's fees yielded on its own depth since the last review,
         // as a yearly rate. Both sides are valued in token0.
-        uint256 poolValue = reserves[0].divWad(weight0);
+        uint256 poolValue = amp != 0 ? reserves[0] + _inToken0(reserves[1]) : reserves[0].divWad(weight0);
         uint256 grossApr = feeValueSinceReview.mulDiv(365 days * WAD, elapsed * poolValue);
 
         // Take a set share of the yield above the reference rate, none of the yield below it.

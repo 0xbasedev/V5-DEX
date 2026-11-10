@@ -47,7 +47,7 @@ abstract contract PoolSetup is Base {
         returns (V5Pool)
     {
         return new V5Pool(
-            V5Pool.PoolConfig(address(a), address(b), weight0, EPOCH, 0.003e18, 0.1e18, cap), _roles(), h, f
+            V5Pool.PoolConfig(address(a), address(b), weight0, EPOCH, 0.003e18, 0.1e18, cap, 0), _roles(), h, f
         );
     }
 
@@ -348,7 +348,7 @@ contract V5PoolSettingsTest is PoolSetup {
         V5Pool p = _ready(
             new V5Pool(
                 V5Pool.PoolConfig(
-                    address(a), address(b), 0.5e18, Defaults.EPOCH, 0.003e18, Defaults.OPENING_CUT, type(uint256).max
+                    address(a), address(b), 0.5e18, Defaults.EPOCH, 0.003e18, Defaults.OPENING_CUT, type(uint256).max, 0
                 ),
                 _roles(),
                 Defaults.hall(),
