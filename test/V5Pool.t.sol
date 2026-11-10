@@ -90,7 +90,9 @@ contract V5PoolTest is PoolSetup {
         vm.prank(alice);
         uint256[2] memory got = pool.collect(id);
         vm.assertApproxEqAbs(got[0], 0.27e18 * 5 / 8, 1e6, "the unlocked part");
-        for (uint256 i; i < 3; ++i) _nextEpoch();
+        for (uint256 i; i < 3; ++i) {
+            _nextEpoch();
+        }
         vm.prank(alice);
         got = pool.collect(id);
         vm.assertApproxEqAbs(got[0], 0.27e18 * 3 / 8, 1e6, "the rest unlocks by the horizon");
@@ -112,7 +114,9 @@ contract V5PoolTest is PoolSetup {
         _nextEpoch();
         vm.prank(alice);
         pool.collect(stay);
-        for (uint256 i; i < 3; ++i) _nextEpoch();
+        for (uint256 i; i < 3; ++i) {
+            _nextEpoch();
+        }
         vm.prank(alice);
         pool.collect(stay);
         uint256 hers = pool.positionOf(stay).paid[0];
@@ -122,7 +126,9 @@ contract V5PoolTest is PoolSetup {
     function test_lockTollNeverExceedsTheRateWrittenAtOpenAndGoesToStayers() public {
         _join(alice, 1000e18, 0);
         uint256 locked = _join(bob, 1000e18, 1);
-        for (uint256 i; i < 5; ++i) _nextEpoch(); // half way through a 10-epoch lock at 10%
+        for (uint256 i; // half way through a 10-epoch lock at 10% i < 5; ++i) {
+            _nextEpoch();
+        }
 
         vm.prank(bob);
         (uint256 out0, uint256 out1) = pool.exit(locked, 0, 0, bob);
@@ -250,7 +256,9 @@ contract Handler is PoolSetup {
         b = b_;
         pool = pool_;
         actors = [alice, bob, trader];
-        for (uint256 i; i < 3; ++i) _fund(actors[i], pool);
+        for (uint256 i; i < 3; ++i) {
+            _fund(actors[i], pool);
+        }
     }
 
     function join(uint256 who, uint256 amount, bool lock) external {

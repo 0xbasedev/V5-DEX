@@ -111,8 +111,8 @@ abstract contract EpochHall {
 
     constructor(HallConfig memory c) {
         if (
-            c.epochLength == 0 || c.horizon == 0 || c.floorWad > WAD || c.unlockedAtZeroWad > WAD
-                || c.polShareWad > WAD || c.lockExitWad > WAD || c.horizon > MAX_EPOCHS || c.lockTerm > MAX_EPOCHS
+            c.epochLength == 0 || c.horizon == 0 || c.floorWad > WAD || c.unlockedAtZeroWad > WAD || c.polShareWad > WAD
+                || c.lockExitWad > WAD || c.horizon > MAX_EPOCHS || c.lockTerm > MAX_EPOCHS
         ) revert BadConfig();
         epochLength = c.epochLength;
         startTime = block.timestamp;
@@ -275,7 +275,8 @@ abstract contract EpochHall {
             (uint256 a1, uint256 b1) = _sumsBefore(rampEnd, token);
             uint256 da = a1 - a0;
             // Here start >= 0, because only positions opened unseasoned ever ramp.
-            scaled += uint256(p.baseWeight) * da + uint256(p.weightPerEpoch) * ((b1 - b0) - uint256(int256(p.start)) * da);
+            scaled += uint256(p.baseWeight) * da + uint256(p.weightPerEpoch)
+            * ((b1 - b0) - uint256(int256(p.start)) * da);
         }
 
         // Mature: full weight.

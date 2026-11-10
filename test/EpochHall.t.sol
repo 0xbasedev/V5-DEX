@@ -59,10 +59,15 @@ contract EpochHallTest is Base {
         hall = _hall(0.5e18, 4, 0.5e18, 0.25e18, 0, 0, false);
     }
 
-    function _hall(uint256 floor, uint256 horizon, uint256 u0, uint256 polShare, uint256 term, uint256 exitWad, bool skip)
-        internal
-        returns (HallHarness)
-    {
+    function _hall(
+        uint256 floor,
+        uint256 horizon,
+        uint256 u0,
+        uint256 polShare,
+        uint256 term,
+        uint256 exitWad,
+        bool skip
+    ) internal returns (HallHarness) {
         return new HallHarness(EpochHall.HallConfig(EPOCH, floor, horizon, u0, polShare, term, exitWad, skip));
     }
 
@@ -156,10 +161,14 @@ contract EpochHallTest is Base {
         HallHarness h = _hall(0.5e18, 4, 0.5e18, 0.25e18, 10, 0.1e18, false);
         uint256 id = h.open(alice, 100e18, 1);
         vm.assertEq(h.tollOf(id), 10e18, "full cost on day one");
-        for (uint256 i; i < 5; ++i) _nextEpoch();
+        for (uint256 i; i < 5; ++i) {
+            _nextEpoch();
+        }
         h.poke(type(uint256).max);
         vm.assertEq(h.tollOf(id), 5e18, "half way, half the cost");
-        for (uint256 i; i < 5; ++i) _nextEpoch();
+        for (uint256 i; i < 5; ++i) {
+            _nextEpoch();
+        }
         h.poke(type(uint256).max);
         vm.assertEq(h.tollOf(id), 0, "free at the end of the term");
         (, uint256 toll) = h.close(id, false);
@@ -177,7 +186,9 @@ contract EpochHallTest is Base {
         vm.assertEq(h.earnedOf(locked, 0), 60e18, "two thirds of the first epoch");
         uint256[2] memory got = h.collect(locked);
         vm.assertEq(got[0], 60e18, "and none of it is held");
-        for (uint256 i; i < 6; ++i) _nextEpoch();
+        for (uint256 i; i < 6; ++i) {
+            _nextEpoch();
+        }
         h.poke(type(uint256).max);
         vm.assertEq(h.weightOf(locked), 100e18, "never more than a seasoned position");
         vm.assertEq(h.weightOf(soft), 100e18, "which the other becomes");
