@@ -23,6 +23,8 @@ ROWS = [
     ("volume", "Volume ($)"),
     ("market_share_pct", "Share of the pair's trading (%)"),
     ("market_growth_pct", "Trading in the pair, vs before we arrived (%)"),
+    ("our_fee_end", "Our fee at the end (%)"),
+    ("our_fee_changes", "Times our fee changed"),
     ("rival_fee_end", "Competitor's fee at the end (%)"),
     ("rival_tvl_end", "Competitor's TVL at the end ($)"),
     ("hard_share_pct", "TVL that is hard-locked (%)"),
@@ -71,7 +73,9 @@ ROWS = [
 def fmt(key, v):
     if v != v:
         return "n/a"
-    if key.startswith("rival_fee"):
+    if key == "our_fee_changes":
+        return f"{v:.1f}"
+    if key.startswith(("rival_fee", "our_fee")):
         return f"{v:.4f}"
     return f"{v:,.1f}" if key.endswith("_pct") or "apr_" in key else f"{v:,.0f}"
 

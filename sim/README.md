@@ -66,7 +66,9 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - Traders react to price. The pair has a fixed amount of trading per day across all venues. Each trade, drawn from a spread of sizes, is split between our pool and one competitor so that the last dollar costs the same in both, counting fee and price impact. That is what an aggregator does. Small trades go wholly to the lower fee; large trades split by depth. A stable pair trades with far less price impact, so its flow is far more sensitive to the fee.
 - Total trading responds to cost. Before we arrive the pair trades `market_daily_volume` a day with the competitor alone. A 1% fall in the average cost of a trade (fee plus price impact, across both venues) adds `demand_elasticity` percent to trading, 1.0 by default. So our depth grows the market, and higher fees anywhere shrink it. Set it to 0 to fix total trading.
 - Traders see the gross fee only. The venue cut sits inside it, so its cost shows up as lower LP yield and, through that, less depth.
-- `competitor_response` sets how the competitor behaves on fee. 0: it never changes. 1: it matches ours whenever ours is lower. 2: every week it moves to whichever fee earns it the most against ours. It first reacts after 14 days and never goes below 0.4 times its day-one fee. Our own fee never changes during a run.
+- `competitor_response` sets how the competitor behaves on fee. 0: it never changes. 1: it matches ours whenever ours is lower. 2: every week it moves to whichever fee earns it the most against ours. It first reacts after 14 days and never goes below 0.4 times its day-one fee.
+- `our_response` sets how our own fee behaves. 0: it never changes. 1: we follow the competitor's fee. 2: every week we move to whichever fee earns the pool the most. Either way the fee stays between 0.4 and 1.0 times its day-one level, a decrease waits `fee_down_delay_days` (1 by default) and an increase waits `fee_up_delay_days` (14).
+- The two sides' LPs are judged differently, and it favours us where the pair is well paid. The competitor's LPs want what they earned before we arrived; ours want the outside rate. In the `tight` scenario those are close, so it is the fairer test of a fee contest.
 - `competitor_depth_speed` lets the competitor's LPs follow yield. Its depth drifts down while its LPs earn less than they did before we arrived, and back up when they earn more. At 2, LPs earning half their old yield leave at about 1.4% of its depth a day. At 0, the default, its depth is fixed. It still chooses its fee looking only at today's depth.
 - A moving price adds the trading needed to keep the pool at the market price, less the moves too small to be worth arbitraging past the fee.
 - LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate, plus the expected loss to price moves. They leave when their planned stay ends.
@@ -78,7 +80,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - The prize slice is paid to the Hall every 30 days as ordinary fees, which approximates "by seasoned weight over the month".
 - Pre-token only: half the buyback line goes to LPs, half is banked up to the holding cap.
 
-Not modelled yet: our own fee responding in turn, more than one competitor, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
+Not modelled yet: more than one competitor, either side looking ahead more than one move, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
 
 ## Reading the output
 

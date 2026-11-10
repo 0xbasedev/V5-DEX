@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from .model import Params, SCENARIOS, competitor_reply, market_volume, our_share, route, run
+from .model import Params, SCENARIOS, competitor_reply, market_volume, our_reply, our_share, route, run
 
 
 class ModelChecks(unittest.TestCase):
@@ -73,6 +73,23 @@ class ModelChecks(unittest.TestCase):
         # If we price ourselves out, it keeps its flow and nearly all its depth.
         priced_out, _ = run(Params(days=120, competitor_depth_speed=2.0, gross_fee_pct=0.2))
         self.assertGreater(priced_out["rival_tvl_end"], 0.97 * Params().competitor_tvl)
+
+    def test_our_fee_moves_only_inside_its_bounds_and_timelocks(self):
+        p = Params(our_response=1)
+        self.assertAlmostEqual(our_reply(p, 0.05, 5e6, 0.035, 1e7), 0.035)   # follows down
+        self.assertAlmostEqual(our_reply(p, 0.05, 5e6, 0.001, 1e7), 0.02)    # floor
+        self.assertAlmostEqual(our_reply(p, 0.05, 5e6, 0.09, 1e7), 0.05)     # cap
+        best = our_reply(p.but(our_response=2), 0.05, 5e6, 0.035, 1e7)
+        self.assertTrue(0.02 - 1e-12 <= best <= 0.05 + 1e-12)
+        # Fixed fee: nothing changes. Following a competitor that undercuts: it does.
+        still, _ = run(Params(days=90, competitor_response=2))
+        self.assertEqual((still["our_fee_end"], still["our_fee_changes"]), (0.05, 0))
+        moved, _ = run(Params(days=90, competitor_response=2, our_response=1))
+        self.assertLess(moved["our_fee_end"], 0.05)
+        self.assertGreaterEqual(moved["our_fee_end"], 0.02 - 1e-12)
+        # A slower timelock on decreases means fewer changes get through.
+        slow, _ = run(Params(days=90, competitor_response=2, our_response=1, fee_down_delay_days=28))
+        self.assertLessEqual(slow["our_fee_changes"], moved["our_fee_changes"])
 
     def test_competitor_replies(self):
         p = Params(gross_fee_pct=0.04)

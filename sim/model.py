@@ -35,6 +35,14 @@ class Params:
 
     # --- fees (spec §18.4, all OPEN) ---
     gross_fee_pct: float = 0.05      # of volume
+    our_response: int = 0            # 0 our fee never changes
+                                     # 1 we follow the competitor's fee, inside our bounds
+                                     # 2 we move to whichever fee earns the pool the most, inside our bounds
+    our_review_days: int = 7         # how often we reconsider
+    fee_down_delay_days: int = 1     # timelock on a fee decrease
+    fee_up_delay_days: int = 14      # timelock on a fee increase
+    our_floor_mult: float = 0.4      # code bounds, as multiples of our day-one fee
+    our_cap_mult: float = 1.0
     venue_cut_pct: float = 10        # of the gross fee
     build_pct: float = 40            # pre-token split of the venue cut; the four lines sum to 100
     pol_pct: float = 20
@@ -167,6 +175,26 @@ def competitor_reply(p, tvl, current_fee_pct, competitor_tvl=None):
     return current_fee_pct
 
 
+def our_reply(p, day_one_fee_pct, tvl, competitor_fee_pct, competitor_tvl):
+    """The fee we would move to, inside the bounds written into the code.
+    `p.gross_fee_pct` is our fee today."""
+    lo, hi = day_one_fee_pct * p.our_floor_mult, day_one_fee_pct * p.our_cap_mult
+    if p.our_response == 1:
+        return max(lo, min(hi, competitor_fee_pct))
+    if p.our_response == 2:
+        best_fee, best_income = p.gross_fee_pct, -1.0
+        for i in range(8, 41):   # 0.40x to 2.00x our day-one fee, in steps of 0.05x
+            fee = day_one_fee_pct * i / 20
+            if fee < lo - 1e-12 or fee > hi + 1e-12:
+                continue
+            share, cost = route(p.but(gross_fee_pct=fee), tvl, competitor_tvl, competitor_fee_pct)
+            income = fee * share * market_volume(p, cost)
+            if income > best_income * (1 + 1e-9):
+                best_fee, best_income = fee, income
+        return best_fee
+    return p.gross_fee_pct
+
+
 def _poisson(rng, lam):
     limit, k, prod = math.exp(-lam), 0, rng.random()
     while prod > limit:
@@ -269,6 +297,10 @@ def run(p: Params):
         out["principal_tolls"] += toll
         done.append(dict(m, t=age, fees=cash - toll + got, il=price_loss(m)))
 
+    live = p              # p with our fee as it stands today
+    pending = None        # (day it takes effect, fee) while a change waits out its timelock
+    our_fee_days = []
+    fee_changes = 0
     rival_fee = p.competitor_fee_pct
     rival_tvl = p.competitor_tvl
     rival_yield_before = p.competitor_fee_pct * p.market_daily_volume / p.competitor_tvl   # fee income per dollar per day, alone
@@ -276,7 +308,7 @@ def run(p: Params):
     market_seen = [0.0, 0.0, 0.0]   # trading in the pair, its cost weighted by trading, the competitor's fee income today
 
     def organic_volume(depth):
-        share, cost = route(p, depth, rival_tvl, rival_fee)
+        share, cost = route(live, depth, rival_tvl, rival_fee)
         market = market_volume(p, cost)
         market_seen[0] += market / E
         market_seen[1] += market / E * cost
@@ -339,9 +371,19 @@ def run(p: Params):
     smooth = 2 / (4 * E + 1)
 
     for day in range(p.days):
+        if pending and day >= pending[0]:
+            live = live.but(gross_fee_pct=pending[1])
+            pending = None
+            fee_changes += 1
+        if p.our_response and pending is None and day and day % p.our_review_days == 0:
+            want = our_reply(live, p.gross_fee_pct, tvl(), rival_fee, rival_tvl)
+            if abs(want - live.gross_fee_pct) > 1e-12:
+                wait = p.fee_down_delay_days if want < live.gross_fee_pct else p.fee_up_delay_days
+                pending = (day + wait, want)
+        our_fee_days.append(live.gross_fee_pct)
         if (p.competitor_response and day >= p.competitor_delay_days
                 and (day - p.competitor_delay_days) % p.competitor_review_days == 0):
-            rival_fee = competitor_reply(p, tvl(), rival_fee, rival_tvl)
+            rival_fee = competitor_reply(live, tvl(), rival_fee, rival_tvl)
         rival_fee_days.append(rival_fee)
         rival_tvl_days.append(rival_tvl)
         if day == p.shock_day:
@@ -391,10 +433,10 @@ def run(p: Params):
                 price *= math.exp(step)
                 # Trading needed to move a 50/50 pool to the new price. Moves smaller
                 # than the fee are not worth arbitraging.
-                arb = max(0.0, abs(step) - p.gross_fee_pct / 100) * tvl() / 4
+                arb = max(0.0, abs(step) - live.gross_fee_pct / 100) * tvl() / 4
             noise = math.exp(rng.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
             volume = organic_volume(tvl()) / E * noise + arb
-            gross = volume * p.gross_fee_pct / 100
+            gross = volume * live.gross_fee_pct / 100
             venue = gross * p.venue_cut_pct / 100
             buyback = venue * p.buyback_pct / 100
             to_bank = min(buyback / 2, max(0.0, p.holding_cap - out["banked"]))
@@ -463,6 +505,9 @@ def run(p: Params):
     out["market_growth_pct"] = 100 * (market_seen[0] / (p.market_daily_volume * p.days) - 1)
     out["trading_cost_pct"] = 100 * market_seen[1] / market_seen[0]
     out["rival_fee_end"] = rival_fee
+    out["our_fee_end"] = live.gross_fee_pct
+    out["our_fee_avg"] = sum(our_fee_days) / len(our_fee_days)
+    out["our_fee_changes"] = fee_changes
     out["rival_fee_avg"] = sum(rival_fee_days) / len(rival_fee_days)
     out["rival_tvl_end"] = rival_tvl
     out["rival_tvl_avg"] = sum(rival_tvl_days) / len(rival_tvl_days)
