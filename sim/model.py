@@ -28,6 +28,10 @@ class Params:
     hard_boost: float = 1.5          # weight multiplier for a locked position
     hard_exit_pct: float = 5         # principal cost of leaving at day zero, melting to zero at the end of the term
     lock_premium_pct: float = 2      # extra APR an LP wants before accepting a lock
+    toll_mode: int = 0               # where a lock's exit toll goes:
+                                     #   0  spec §18.3: a POL share, the rest to all seasoned weight
+                                     #   1  all to LPs locked before the exit, each toll paid out over one lock term
+                                     #   2  all to LPs locked before the exit, unlocking over the receiver's own term
 
     # --- fees (spec §18.4, all OPEN) ---
     gross_fee_pct: float = 0.05      # of volume
@@ -50,7 +54,8 @@ class Params:
     volume_sigma: float = 0.35           # per-epoch noise
     anchor_tvl: float = 500_000          # anchor tenants, in from day one and never leaving
     annual_vol_pct: float = 0            # price volatility of the pair; 0 is a stable pair
-    shock_day: int = -1                  # day of a one-off market shock; -1 for none
+    shock_day: int = -1                  # day of a market shock; -1 for none
+    shock_day2: int = -1                 # day of a second shock; -1 for none
     shock_drop_pct: float = 30           # price fall on that day
     shock_fear_pct: float = 5            # LPs each fear losing up to this much of their position
     inertia_pct: float = 0.05            # fear below this never moves anyone
@@ -89,6 +94,7 @@ SCENARIOS = {
     "volatile": dict(_VOLATILE),
     "shock": dict(_VOLATILE, shock_day=90),
     "hardlock": dict(_VOLATILE, shock_day=90, hard_lock_days=90),
+    "twoshock": dict(_VOLATILE, shock_day=90, shock_day2=150, hard_lock_days=90, days=240),
 }
 
 _Z = [NormalDist().inv_cdf((i + 0.5) / 32) for i in range(32)]
@@ -146,24 +152,49 @@ def run(p: Params):
     done = []     # dict per finished or still-open position
     shares = 0.0  # real shares in the pool; weight boosts live only in the Hall
     out = dict(volume=0.0, lp_fees=0.0, build=0.0, banked=0.0, bank_overflow_to_lps=0.0,
-               forfeited_fees=0.0, principal_tolls=0.0, venue_cut=0.0)
+               forfeited_fees=0.0, principal_tolls=0.0, venue_cut=0.0, tolls_to_lockers=0.0)
     offered = {k: 0.0 for k in KINDS}
     accepted = {k: 0.0 for k in KINDS}
     late = [0.0, 0.0]   # long capital offered and accepted in the second half
     pol_cash = prize_pot = pol_seen = 0.0
     seasoned_days, tvl_days, hard_days = [], [], []
-    shock = {}   # what the pool looked like at the shock, and who stayed
+    shock = {}   # what the pool looked like at each shock, and who stayed
+    toll_events = []     # (epoch, dollars per locked share) for tolls paid to lockers
+    locked_shares = 0.0
 
     def tvl():
         return shares * index()
 
     def open_position(kind, size, stay, tier="soft"):
-        nonlocal shares
+        nonlocal shares, locked_shares
         s = size / index()
         pid = hall.deposit(kind, s * (p.hard_boost if tier == "hard" else 1.0))
         meta[pid] = dict(kind=kind, s=s, size=size, e_in=hall.e, tier=tier, price_in=price,
-                         e_out=None if stay is None else hall.e + stay)
+                         e_out=None if stay is None else hall.e + stay, toll_idx=len(toll_events))
         shares += s
+        if tier == "hard":
+            locked_shares += s
+
+    def toll_credit(m):
+        """(paid out so far, still to come) from tolls credited to a locked position."""
+        if m["tier"] != "hard" or not p.toll_mode:
+            return 0.0, 0.0
+        age = hall.e - m["e_in"]
+        got = waiting = 0.0
+        for when, per_share in toll_events[m["toll_idx"]:]:
+            done_frac = min(1.0, ((hall.e - when) if p.toll_mode == 1 else age) / term)
+            got += per_share * done_frac
+            waiting += per_share * (1 - done_frac)
+        return m["s"] * got, m["s"] * waiting
+
+    def pay_lockers(amount):
+        if amount <= 0:
+            return
+        out["tolls_to_lockers"] += amount
+        if locked_shares > 0:
+            toll_events.append((hall.e, amount / locked_shares))
+        else:
+            hall.add_fees(amount)   # nobody locked to receive it
 
     def toll_rate(m, age):
         if m["tier"] == "hard":
@@ -171,18 +202,24 @@ def run(p: Params):
         return p.principal_floor_pct / 100 * max(0.0, 1 - age / H)
 
     def close(pid):
-        nonlocal shares, pol_cash
+        nonlocal shares, pol_cash, locked_shares
         m = meta.pop(pid)
         age = hall.e - m["e_in"]
         value = m["s"] * index()
         cash, forfeited = hall.exit(pid)
         toll = value * toll_rate(m, age)
-        pol_cash += toll * pol_cut
-        hall.add_fees(toll * (1 - pol_cut))
+        got, waiting = toll_credit(m)
+        shares -= m["s"]
+        if m["tier"] == "hard":
+            locked_shares -= m["s"]
+        if p.toll_mode and m["tier"] == "hard":
+            pay_lockers(toll + waiting)   # the leaver's toll, and the credits they walk away from
+        else:
+            pol_cash += toll * pol_cut
+            hall.add_fees(toll * (1 - pol_cut))
         out["forfeited_fees"] += forfeited
         out["principal_tolls"] += toll
-        shares -= m["s"]
-        done.append(dict(m, t=age, fees=cash - toll, il=price_loss(m)))
+        done.append(dict(m, t=age, fees=cash - toll + got, il=price_loss(m)))
 
     def organic_volume(depth):
         return p.market_daily_volume * our_share(p, depth)
@@ -199,6 +236,43 @@ def run(p: Params):
         toll = 0.0 if tier == "hard" else size * p.principal_floor_pct / 100 * max(0.0, 1 - T / H)
         return (kept - toll) / size * per_year / T * 100
 
+    def run_shock(tag):
+        nonlocal price
+        if volatile:
+            price *= 1 - p.shock_drop_pct / 100
+        before = shares
+        groups = {g: [0.0, 0.0] for g in ("seasoned", "fresh", "hard", "soft", "hard_mid", "hard_done")}
+
+        def tally(m, col):
+            if m["kind"] in KINDS:
+                age = hall.e - m["e_in"]
+                groups["seasoned" if age >= H else "fresh"][col] += m["s"]
+                groups[m["tier"]][col] += m["s"]
+                if m["tier"] == "hard":
+                    groups["hard_done" if age >= term else "hard_mid"][col] += m["s"]
+
+        for m in meta.values():
+            tally(m, 0)
+        for pid in [k for k, m in meta.items() if m["kind"] in KINDS]:
+            if rng.random() < p.passive_pct / 100:
+                continue
+            m = meta[pid]
+            value = m["s"] * index()
+            q = hall.pos[pid]
+            locked = q.earned - q.paid - hall.unlocked_now(pid)
+            cost = locked + value * toll_rate(m, hall.e - m["e_in"]) + toll_credit(m)[1]
+            fear = rng.uniform(0, p.shock_fear_pct) / 100 * value
+            if fear > cost + value * p.inertia_pct / 100:
+                close(pid)
+        for m in meta.values():
+            tally(m, 1)
+        lp_before = groups["seasoned"][0] + groups["fresh"][0]
+        shock[f"{tag}_retained_pct"] = 100 * shares / before
+        shock[f"{tag}_seasoned_mix_pct"] = 100 * groups["seasoned"][0] / lp_before if lp_before else float("nan")
+        shock[f"{tag}_hard_mix_pct"] = 100 * groups["hard"][0] / lp_before if lp_before else float("nan")
+        for g, (was, now) in groups.items():
+            shock[f"{tag}_kept_{g}_pct"] = 100 * now / was if was else float("nan")
+
     open_position("anchor", p.anchor_tvl, None)
     gross0 = organic_volume(tvl()) / E * p.gross_fee_pct / 100
     rate = gross0 * (1 - p.venue_cut_pct / 100 * (1 - p.buyback_pct / 200))   # smoothed fees reaching the Hall per epoch
@@ -206,37 +280,9 @@ def run(p: Params):
 
     for day in range(p.days):
         if day == p.shock_day:
-            if volatile:
-                price *= 1 - p.shock_drop_pct / 100
-            before = shares
-            groups = {"seasoned": [0.0, 0.0], "fresh": [0.0, 0.0], "hard": [0.0, 0.0], "soft": [0.0, 0.0]}
-
-            def tally(m, col):
-                if m["kind"] in KINDS:
-                    groups["seasoned" if hall.e - m["e_in"] >= H else "fresh"][col] += m["s"]
-                    groups[m["tier"]][col] += m["s"]
-
-            for m in meta.values():
-                tally(m, 0)
-            for pid in [k for k, m in meta.items() if m["kind"] in KINDS]:
-                if rng.random() < p.passive_pct / 100:
-                    continue
-                m = meta[pid]
-                value = m["s"] * index()
-                q = hall.pos[pid]
-                locked = q.earned - q.paid - hall.unlocked_now(pid)
-                cost = locked + value * toll_rate(m, hall.e - m["e_in"])
-                fear = rng.uniform(0, p.shock_fear_pct) / 100 * value
-                if fear > cost + value * p.inertia_pct / 100:
-                    close(pid)
-            for m in meta.values():
-                tally(m, 1)
-            lp_before = groups["seasoned"][0] + groups["fresh"][0]
-            shock["shock_retained_pct"] = 100 * shares / before
-            shock["shock_seasoned_mix_pct"] = 100 * groups["seasoned"][0] / lp_before if lp_before else float("nan")
-            shock["shock_hard_mix_pct"] = 100 * groups["hard"][0] / lp_before if lp_before else float("nan")
-            for g, (was, now) in groups.items():
-                shock[f"shock_kept_{g}_pct"] = 100 * now / was if was else float("nan")
+            run_shock("shock")
+        if day == p.shock_day2:
+            run_shock("shock2")
 
         # LPs whose planned stay is over leave.
         for pid in [k for k, m in meta.items() if m["e_out"] is not None and m["e_out"] <= hall.e]:
@@ -314,7 +360,8 @@ def run(p: Params):
     hall.settle_all()
     for pid, m in meta.items():
         # Still in at the end: count what they have earned, on the view that they stay to unlock it.
-        done.append(dict(m, t=hall.e - m["e_in"], fees=hall.pos[pid].earned, il=price_loss(m)))
+        done.append(dict(m, t=hall.e - m["e_in"], fees=hall.pos[pid].earned + sum(toll_credit(m)),
+                         il=price_loss(m)))
 
     def apr(rows, net):
         dollar_epochs = sum(r["size"] * r["t"] for r in rows)
@@ -335,9 +382,10 @@ def run(p: Params):
     out["tvl_avg"] = sum(tvl_days) / len(tvl_days)
     out["seasoned_share_pct"] = 100 * sum(seasoned_days) / len(seasoned_days) if seasoned_days else float("nan")
     out["hard_share_pct"] = 100 * sum(hard_days) / len(hard_days)
-    for k in ("shock_retained_pct", "shock_seasoned_mix_pct", "shock_hard_mix_pct", "shock_kept_seasoned_pct",
-              "shock_kept_fresh_pct", "shock_kept_hard_pct", "shock_kept_soft_pct"):
-        out[k] = shock.get(k, float("nan"))
+    for tag in ("shock", "shock2"):
+        for k in ("retained", "seasoned_mix", "hard_mix", "kept_seasoned", "kept_fresh", "kept_hard", "kept_soft",
+                  "kept_hard_mid", "kept_hard_done"):
+            out[f"{tag}_{k}_pct"] = shock.get(f"{tag}_{k}_pct", float("nan"))
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
     out["market_share_pct"] = 100 * out["volume"] / (p.market_daily_volume * p.days)
 

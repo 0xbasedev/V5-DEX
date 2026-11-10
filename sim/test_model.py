@@ -38,6 +38,17 @@ class ModelChecks(unittest.TestCase):
         volatile_loss = 1 / 3 - our_share(v.but(gross_fee_pct=0.42), 5_000_000)
         self.assertLess(volatile_loss, stable_loss)
 
+    def test_tolls_paid_to_lockers_reach_nobody_else(self):
+        base = Params(days=200, seed=5).but(**SCENARIOS["twoshock"]).but(days=200)
+        for mode in (1, 2):
+            out, hall = run(base.but(toll_mode=mode))
+            self.assertGreater(out["principal_tolls"], 0)
+            # Every toll went to lockers (plus re-paid credits that leavers walked away from).
+            self.assertGreaterEqual(out["tolls_to_lockers"], out["principal_tolls"] - 1e-6)
+            # POL received only its fee line and its share of forfeited fees: no toll money.
+            split, _ = run(base.but(toll_mode=0))
+            self.assertLess(out["pol_value"], split["pol_value"])
+
     def test_same_seed_same_result(self):
         p = Params(days=60, seed=7).but(**SCENARIOS["hardlock"]).but(shock_day=30)
         self.assertEqual(repr(run(p)[0]), repr(run(p)[0]))   # repr, because nan != nan

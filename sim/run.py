@@ -1,7 +1,7 @@
 """Run the V5 simulator.
 
   python3 -m sim.run                       the stable-pair scenario against a plain pool
-  python3 -m sim.run --scenario shock      stable | tight | volatile | shock | hardlock
+  python3 -m sim.run --scenario shock      stable | tight | volatile | shock | hardlock | twoshock
   python3 -m sim.run --set floor=0.6 --set horizon_days=14
   python3 -m sim.run --sweep               floor x horizon grid, written to sim/out/sweep-<scenario>.csv
   python3 -m sim.run --sweep fees          gross fee x venue cut grid, written to sim/out/fees-<scenario>.csv
@@ -31,6 +31,12 @@ ROWS = [
     ("shock_kept_fresh_pct", "  of fresh capital (%)"),
     ("shock_kept_hard_pct", "  of hard-locked capital (%)"),
     ("shock_kept_soft_pct", "  of unlocked capital (%)"),
+    ("At the second shock", None),
+    ("shock2_hard_mix_pct", "LP capital that was hard-locked (%)"),
+    ("shock2_retained_pct", "Liquidity still there afterwards (%)"),
+    ("shock2_kept_hard_mid_pct", "  of capital still inside its lock (%)"),
+    ("shock2_kept_hard_done_pct", "  of capital past its lock term (%)"),
+    ("shock2_kept_soft_pct", "  of unlocked capital (%)"),
     ("Who gets in (% of capital offered)", None),
     ("accepted_hot_pct", "Hot money, stays days"),
     ("accepted_medium_pct", "Medium, stays weeks"),
@@ -55,6 +61,7 @@ ROWS = [
     ("banked", "Banked for the launch burn"),
     ("forfeited_fees", "Fees forfeited by early leavers"),
     ("principal_tolls", "Principal paid to leave a lock early"),
+    ("tolls_to_lockers", "  of which paid on to LPs who stayed locked"),
 ]
 
 
@@ -81,7 +88,7 @@ def scenario(p, seeds, name):
 
     def cell(key, vals, errs):
         text = fmt(key, vals[key])
-        return f"{text} ±{errs[key]:.1f}" if key.startswith("shock_") and key in errs else text
+        return f"{text} ±{errs[key]:.1f}" if key.startswith("shock") and key in errs else text
 
     lock = f", hard lock {p.hard_lock_days:g} days" if p.hard_lock_days else ""
     print(f"{name}: floor {p.floor}, horizon {p.horizon_days:g} days{lock}, {p.days} days, mean of {seeds} runs\n")

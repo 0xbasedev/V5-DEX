@@ -54,6 +54,7 @@ The spec leaves these open. They are choices made here, not rulings, and `hall.p
 | `volatile` | A 50/50 pair with a moving price, a higher fee and less organic volume. |
 | `shock` | `volatile`, plus a 30% price fall on day 90 that makes LPs consider leaving. |
 | `hardlock` | `shock`, with a 90-day hard-lock tier on offer. |
+| `twoshock` | `hardlock` over 240 days with a second shock on day 150, so some locks have run their term. |
 
 Any parameter can be overridden with `--set name=value`, and `--sweep` works with any scenario.
 
@@ -69,6 +70,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate, plus the expected loss to price moves. They leave when their planned stay ends.
 - In a shock, 60% of LPs do nothing. Each of the rest fears losing up to 5% of their position and leaves if that fear is larger than what leaving costs them.
 - A hard-locked position seasons on the same ramp with a weight multiplier, and pays a share of principal to leave early that melts to zero over the term. An LP takes the lock only if it plans to stay the whole term and the lock pays enough more.
+- `toll_mode` sets where a lock's exit toll goes. 0 is spec §18.3: a POL share, the rest to all seasoned weight. 1 pays it all to LPs locked before the exit, each toll paid out over one lock term and lost by a receiver who leaves first. 2 is the same, except the credit unlocks over the receiver's own lock term.
 - Anchor tenants are in from day one and never leave.
 - The venue's POL line, and the POL share of forfeits and tolls, are deposited as liquidity daily.
 - The prize slice is paid to the Hall every 30 days as ordinary fees, which approximates "by seasoned weight over the month".
