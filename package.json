@@ -1,0 +1,17 @@
+{
+  "name": "v5-dex",
+  "private": true,
+  "description": "V5 pool contracts and simulator",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "test:sim": "python3 -m unittest sim.test_hall sim.test_model"
+  },
+  "devDependencies": {
+    "@foundry-rs/forge": "1.7.1",
+    "solady": "latest"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@foundry-rs/forge"]
+  }
+}
