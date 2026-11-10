@@ -26,7 +26,11 @@ class Params:
     # --- hard-lock tier (spec §3, all OPEN; 0 days switches it off) ---
     hard_lock_days: float = 0
     hard_boost: float = 1.5          # weight multiplier for a locked position
-    hard_exit_pct: float = 5         # principal cost of leaving at day zero, melting to zero at the end of the term
+    hard_exit_pct: float = 5         # principal cost of leaving on the first day of a term
+    lock_melt_floor: float = 0.0     # how far the exit cost melts within a term: 0 melts to nothing by the end,
+                                     # 0.5 stops at half, 1 never melts. It is always zero once the lock has ended.
+    lock_rolls: int = 0              # 1: a lock renews for another term at the end of each one, for as long as
+                                     # the LP still plans to stay a whole further term
     toll_mode: int = 0               # where a lock's exit toll goes:
                                      #   0  spec §18.3: a POL share, the rest to all seasoned weight
                                      #   1  all to LPs locked before the exit, each toll paid out over one lock term
@@ -243,12 +247,13 @@ def run(p: Params):
     def tvl():
         return shares * index()
 
-    def open_position(kind, size, stay, tier="soft"):
+    def open_position(kind, size, stay, tier="soft", terms=1):
         nonlocal shares, locked_shares
         s = size / index()
         pid = hall.deposit(kind, s * (p.hard_boost if tier == "hard" else 1.0))
         meta[pid] = dict(kind=kind, s=s, size=size, e_in=hall.e, tier=tier, price_in=price,
-                         e_out=None if stay is None else hall.e + stay, toll_idx=len(toll_events))
+                         e_out=None if stay is None else hall.e + stay, toll_idx=len(toll_events),
+                         lock_end=hall.e + terms * term)
         shares += s
         if tier == "hard":
             locked_shares += s
@@ -274,9 +279,18 @@ def run(p: Params):
         else:
             hall.add_fees(amount)   # nobody locked to receive it
 
+    def lock_cost_shape(age):
+        """Share of the full exit cost due at this age, inside a term."""
+        return max(p.lock_melt_floor, 1 - (age % term) / term)
+
+    def terms_for(T):
+        return max(1, T // term) if p.lock_rolls and term else 1
+
     def toll_rate(m, age):
         if m["tier"] == "hard":
-            return p.hard_exit_pct / 100 * max(0.0, 1 - age / term)
+            if hall.e >= m["lock_end"]:
+                return 0.0
+            return p.hard_exit_pct / 100 * lock_cost_shape(age)
         return p.principal_floor_pct / 100 * max(0.0, 1 - age / H)
 
     def close(pid):
@@ -342,7 +356,7 @@ def run(p: Params):
                 groups["seasoned" if age >= H else "fresh"][col] += m["s"]
                 groups[m["tier"]][col] += m["s"]
                 if m["tier"] == "hard":
-                    groups["hard_done" if age >= term else "hard_mid"][col] += m["s"]
+                    groups["hard_done" if hall.e >= m["lock_end"] else "hard_mid"][col] += m["s"]
 
         for m in meta.values():
             tally(m, 0)
@@ -360,6 +374,8 @@ def run(p: Params):
         for m in meta.values():
             tally(m, 1)
         lp_before = groups["seasoned"][0] + groups["fresh"][0]
+        shock[f"{tag}_free_mix_pct"] = (100 * groups["hard_done"][0] / groups["hard"][0]
+                                        if groups["hard"][0] else float("nan"))
         shock[f"{tag}_retained_pct"] = 100 * shares / before
         shock[f"{tag}_seasoned_mix_pct"] = 100 * groups["seasoned"][0] / lp_before if lp_before else float("nan")
         shock[f"{tag}_hard_mix_pct"] = 100 * groups["hard"][0] / lp_before if lp_before else float("nan")
@@ -370,12 +386,17 @@ def run(p: Params):
 
     def lock_price(need, T):
         """What a lock costs an LP, as APR over their planned stay: the chance they
-        need out before the term ends, times the toll they would pay then, weighed
+        need out while still locked, times the toll they would pay then, weighed
         by how much they dislike that risk."""
         if not need:
             return 0.0
-        x = need * term / per_year   # expected number of needs during the term
-        expected_toll = p.hard_exit_pct * (1 - (1 - math.exp(-x)) / x)
+        steps = 12 * terms_for(T)
+        dt = term / 12
+        expected_toll = 0.0
+        for i in range(steps):
+            age = (i + 0.5) * dt
+            chance = math.exp(-need * i * dt / per_year) - math.exp(-need * (i + 1) * dt / per_year)
+            expected_toll += chance * p.hard_exit_pct * lock_cost_shape(age)
         return p.lock_aversion * expected_toll * per_year / T
 
     open_position("anchor", p.anchor_tvl, None)
@@ -440,7 +461,7 @@ def run(p: Params):
                 if need:
                     surprise = round(rng.expovariate(need) * per_year)   # when the need actually arrives
                     stay = max(1, min(T, surprise))
-                open_position(kind, size, stay, tier)
+                open_position(kind, size, stay, tier, terms_for(T))
 
         # The venue's POL line, and its share of forfeits and tolls, go in as liquidity.
         pol_cash += hall.pol - pol_seen
@@ -524,7 +545,7 @@ def run(p: Params):
     out["hard_share_pct"] = 100 * sum(hard_days) / len(hard_days)
     for tag in ("shock", "shock2"):
         for k in ("retained", "seasoned_mix", "hard_mix", "kept_seasoned", "kept_fresh", "kept_hard", "kept_soft",
-                  "kept_hard_mid", "kept_hard_done"):
+                  "kept_hard_mid", "kept_hard_done", "free_mix"):
             out[f"{tag}_{k}_pct"] = shock.get(f"{tag}_{k}_pct", float("nan"))
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
     out["market_share_pct"] = 100 * out["volume"] / market_seen[0]

@@ -78,6 +78,19 @@ class ModelChecks(unittest.TestCase):
         needy = run(base.but(shock_day=-1))[0]
         self.assertGreater(needy["principal_tolls"], 0)
 
+    def test_rolling_and_non_melting_locks(self):
+        base = Params(seed=4).but(**SCENARIOS["twoshock"]).but(hard_boost=1.25, hard_exit_pct=10)
+        plain = run(base)[0]
+        rolling = run(base.but(lock_rolls=1))[0]
+        flat = run(base.but(lock_melt_floor=1.0))[0]
+        # Rolling leaves less locked capital free to walk at the second shock.
+        self.assertLess(rolling["shock2_free_mix_pct"], plain["shock2_free_mix_pct"])
+        # A lock that costs more to leave is taken by fewer LPs.
+        self.assertLessEqual(flat["lock_take_pct"], plain["lock_take_pct"])
+        self.assertLessEqual(rolling["lock_take_pct"], plain["lock_take_pct"])
+        # melt floor 0 with no rolling is the old behaviour: same run, same result.
+        self.assertEqual(repr(run(base.but(lock_melt_floor=0.0, lock_rolls=0))[0]), repr(plain))
+
     def test_competitor_depth_follows_its_yield(self):
         fixed, _ = run(Params(days=120))
         self.assertEqual(fixed["rival_tvl_end"], Params().competitor_tvl)

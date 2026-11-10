@@ -39,6 +39,7 @@ ROWS = [
     ("shock_kept_soft_pct", "  of unlocked capital (%)"),
     ("At the second shock", None),
     ("shock2_hard_mix_pct", "LP capital that was hard-locked (%)"),
+    ("shock2_free_mix_pct", "Locked capital whose lock had ended (%)"),
     ("shock2_retained_pct", "Liquidity still there afterwards (%)"),
     ("shock2_kept_hard_mid_pct", "  of capital still inside its lock (%)"),
     ("shock2_kept_hard_done_pct", "  of capital past its lock term (%)"),
