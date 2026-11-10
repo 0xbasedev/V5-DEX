@@ -155,5 +155,21 @@ class ModelChecks(unittest.TestCase):
         self.assertGreater(out["bank_overflow_to_lps"], 0)
 
 
+class SearchChecks(unittest.TestCase):
+    def test_designs_stay_inside_the_space_and_tidy_up(self):
+        import random
+        from .search import SPACE, frontier, mutate, random_design, tidy
+        rng = random.Random(0)
+        for _ in range(200):
+            d = mutate(rng, random_design(rng))
+            self.assertTrue(all(d[k] in SPACE[k] for k in SPACE))
+            self.assertNotIn("hard_boost", d)                       # the boost is ruled out
+            if not d["hard_lock_days"]:
+                self.assertEqual((d["toll_mode"], d["hard_skips_ramp"], d["lock_budget_pct"]), (0, 0, 0))
+        rows = [dict(revenue_x=2.0, kept_points=1.0), dict(revenue_x=1.0, kept_points=5.0),
+                dict(revenue_x=1.5, kept_points=0.5), dict(revenue_x=0.9, kept_points=4.0)]
+        self.assertEqual([r["revenue_x"] for r in frontier(rows)], [2.0, 1.0])
+
+
 if __name__ == "__main__":
     unittest.main()

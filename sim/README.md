@@ -11,6 +11,7 @@ python3 -m sim.run --sweep               # floor x horizon grid -> sim/out/sweep
 python3 -m sim.run --sweep fees          # gross fee x venue cut grid -> sim/out/fees-<scenario>.csv
 python3 -m sim.run --sweep lock --scenario hardlock   # lock boost x exit cost grid
 python3 -m sim.run --set floor=0.6 --set horizon_days=14 --seeds 20
+python3 -m sim.search                    # search the design space; about five minutes on four cores
 ```
 
 ## What is here
@@ -22,6 +23,7 @@ python3 -m sim.run --set floor=0.6 --set horizon_days=14 --seeds 20
 | `model.py` | One V5 pool, a fee waterfall, and a stream of LPs who each decide whether to enter. |
 | `test_model.py` | Checks that every scenario accounts for every fee and every banked dollar. |
 | `run.py` | Command line: a scenario table, or a parameter sweep. |
+| `search.py` | Searches the settings the protocol controls for designs that beat the plain pool. |
 
 ## The first test
 
@@ -45,6 +47,18 @@ The spec leaves these open. They are choices made here, not rulings, and `hall.p
 - The unlocked share applies to all fees a position has earned so far, and rises on the same line as its weight.
 - Held fees travel with a transferred position. Deferred claims stay with the wallet.
 - Compounding is in whole units; one unit of fees buys one unit of shares.
+
+## The search
+
+`search.py` tries combinations of the settings the protocol controls: seasoning, the venue cut, the lock, and how our fee responds. The lock's weight boost is left out, because it has been ruled out.
+
+- Each design is run in four markets: a stable pair with a competitor that never reacts, the same with one that does, a thin stable pair with one that does, and a volatile pair with two shocks.
+- A design is kept only if its depth is within the tolerance (3% by default) of the plain pool's in every market.
+- Keepers are ranked on what the venue ends up with and on how much more liquidity stays through a shock.
+- The leaders are run again on random draws they have not seen. The best of many noisy results always looks better than it is, so only those second numbers are reported.
+- Each finalist is also compared with itself minus seasoning and the lock, to separate what seasoning adds from what the fee policy and venue cut add.
+
+The plain pool it is measured against has no seasoning, a fee that never changes and a 10% venue cut.
 
 ## Scenarios
 
