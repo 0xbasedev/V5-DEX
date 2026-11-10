@@ -55,6 +55,9 @@ class Params:
     competitor_delay_days: int = 14      # how long before it first reacts
     competitor_review_days: int = 7      # how often it reconsiders after that
     competitor_floor_mult: float = 0.4   # it never goes below this multiple of its day-one fee
+    competitor_depth_speed: float = 0.0  # how fast its LPs follow yield. At 2, a competitor whose LPs earn half
+                                         # what they did before we arrived loses about 1.4% of its depth a day.
+                                         # 0 fixes its depth.
     trade_median: float = 5_000          # trade sizes are lognormal
     trade_sigma: float = 1.5
     depth_multiplier: float = 50         # how much deeper than 50/50 the curve trades; 1 for a volatile pair
@@ -145,7 +148,7 @@ def market_volume(p, cost):
     return p.market_daily_volume * (cost / reference) ** -p.demand_elasticity
 
 
-def competitor_reply(p, tvl, current_fee_pct):
+def competitor_reply(p, tvl, current_fee_pct, competitor_tvl=None):
     """The fee the competitor moves to when it reconsiders."""
     floor = p.competitor_fee_pct * p.competitor_floor_mult
     if p.competitor_response == 1:
@@ -156,7 +159,7 @@ def competitor_reply(p, tvl, current_fee_pct):
             fee = p.competitor_fee_pct * i / 20
             if fee < floor - 1e-12:
                 continue
-            share, cost = route(p, tvl, competitor_fee_pct=fee)
+            share, cost = route(p, tvl, competitor_tvl, fee)
             income = fee * (1 - share) * market_volume(p, cost)
             if income > best_income * (1 + 1e-9):
                 best_fee, best_income = fee, income
@@ -267,15 +270,17 @@ def run(p: Params):
         done.append(dict(m, t=age, fees=cash - toll + got, il=price_loss(m)))
 
     rival_fee = p.competitor_fee_pct
-    rival_fee_days = []
-
-    market_seen = [0.0, 0.0]   # trading in the whole pair, and its cost weighted by that trading
+    rival_tvl = p.competitor_tvl
+    rival_yield_before = p.competitor_fee_pct * p.market_daily_volume / p.competitor_tvl   # fee income per dollar per day, alone
+    rival_fee_days, rival_tvl_days = [], []
+    market_seen = [0.0, 0.0, 0.0]   # trading in the pair, its cost weighted by trading, the competitor's fee income today
 
     def organic_volume(depth):
-        share, cost = route(p, depth, competitor_fee_pct=rival_fee)
+        share, cost = route(p, depth, rival_tvl, rival_fee)
         market = market_volume(p, cost)
         market_seen[0] += market / E
         market_seen[1] += market / E * cost
+        market_seen[2] += market / E * (1 - share) * rival_fee
         return market * share
 
     def expected_apr(size, T, tier):
@@ -329,15 +334,16 @@ def run(p: Params):
 
     open_position("anchor", p.anchor_tvl, None)
     gross0 = organic_volume(tvl()) / E * p.gross_fee_pct / 100
-    market_seen[:] = [0.0, 0.0]
+    market_seen[:] = [0.0, 0.0, 0.0]
     rate = gross0 * (1 - p.venue_cut_pct / 100 * (1 - p.buyback_pct / 200))   # smoothed fees reaching the Hall per epoch
     smooth = 2 / (4 * E + 1)
 
     for day in range(p.days):
         if (p.competitor_response and day >= p.competitor_delay_days
                 and (day - p.competitor_delay_days) % p.competitor_review_days == 0):
-            rival_fee = competitor_reply(p, tvl(), rival_fee)
+            rival_fee = competitor_reply(p, tvl(), rival_fee, rival_tvl)
         rival_fee_days.append(rival_fee)
+        rival_tvl_days.append(rival_tvl)
         if day == p.shock_day:
             run_shock("shock")
         if day == p.shock_day2:
@@ -411,6 +417,12 @@ def run(p: Params):
             out["lp_fees"] += prize_pot
             prize_pot = 0.0
 
+        if p.competitor_depth_speed:
+            # Its LPs drift toward or away from it until they earn what they did before we arrived.
+            ratio = market_seen[2] / rival_tvl / rival_yield_before
+            rival_tvl *= max(0.5, min(2.0, ratio)) ** (p.competitor_depth_speed / 100)
+            rival_tvl = max(0.02 * p.competitor_tvl, min(5 * p.competitor_tvl, rival_tvl))
+        market_seen[2] = 0.0
         tvl_days.append(tvl())
         hard_days.append(sum(m["s"] for m in meta.values() if m["tier"] == "hard") / shares)
         if hall.e >= H:
@@ -452,6 +464,8 @@ def run(p: Params):
     out["trading_cost_pct"] = 100 * market_seen[1] / market_seen[0]
     out["rival_fee_end"] = rival_fee
     out["rival_fee_avg"] = sum(rival_fee_days) / len(rival_fee_days)
+    out["rival_tvl_end"] = rival_tvl
+    out["rival_tvl_avg"] = sum(rival_tvl_days) / len(rival_tvl_days)
 
     # Growth-trap probe: over one horizon starting mid-run, what does a brand-new
     # dollar earn compared with a fully seasoned one?

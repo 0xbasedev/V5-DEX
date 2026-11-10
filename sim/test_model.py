@@ -63,6 +63,17 @@ class ModelChecks(unittest.TestCase):
         self.assertLess(market_volume(p.but(demand_elasticity=2), dear), market_volume(p, dear))
         self.assertEqual(market_volume(p.but(demand_elasticity=0), dear), p.market_daily_volume)
 
+    def test_competitor_depth_follows_its_yield(self):
+        fixed, _ = run(Params(days=120))
+        self.assertEqual(fixed["rival_tvl_end"], Params().competitor_tvl)
+        # We take flow from it, so its LPs earn less than before and some leave.
+        moving, _ = run(Params(days=120, competitor_depth_speed=2.0))
+        self.assertLess(moving["rival_tvl_end"], Params().competitor_tvl)
+        self.assertGreater(moving["market_share_pct"], fixed["market_share_pct"])
+        # If we price ourselves out, it keeps its flow and nearly all its depth.
+        priced_out, _ = run(Params(days=120, competitor_depth_speed=2.0, gross_fee_pct=0.2))
+        self.assertGreater(priced_out["rival_tvl_end"], 0.97 * Params().competitor_tvl)
+
     def test_competitor_replies(self):
         p = Params(gross_fee_pct=0.04)
         self.assertEqual(competitor_reply(p, 5e6, 0.05), 0.05)                              # static

@@ -24,6 +24,7 @@ ROWS = [
     ("market_share_pct", "Share of the pair's trading (%)"),
     ("market_growth_pct", "Trading in the pair, vs before we arrived (%)"),
     ("rival_fee_end", "Competitor's fee at the end (%)"),
+    ("rival_tvl_end", "Competitor's TVL at the end ($)"),
     ("hard_share_pct", "TVL that is hard-locked (%)"),
     ("At the shock", None),
     ("shock_seasoned_mix_pct", "LP capital that was fully seasoned (%)"),
@@ -108,7 +109,7 @@ def sweep_fees(p, seeds, name):
     """Gross fee (as a multiple of the competitor's) by venue cut."""
     multiples = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0]
     cuts = [10, 20, 40]
-    cols = ["tvl_avg", "volume", "market_share_pct", "market_growth_pct", "rival_fee_end", "apr_long", "venue_cut"]
+    cols = ["tvl_end", "market_share_pct", "market_growth_pct", "rival_fee_end", "rival_tvl_end", "apr_long", "venue_cut"]
     os.makedirs("sim/out", exist_ok=True)
     path = f"sim/out/fees-{name}.csv"
     print(f"{'fee %':>7}{'cut %':>7}" + "".join(f"{c:>18}" for c in cols))
