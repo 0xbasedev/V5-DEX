@@ -118,11 +118,28 @@ Traders never see the cut, because it sits inside the fee. LPs do: it lowers the
 - In a well-paid pool, going from 10% to 40% costs 4% of depth and nearly quadruples revenue.
 - In a thin pool it costs 43% of depth for two and a half times the revenue, and the last step from 30% to 40% gives up 20% of depth for 10% more revenue.
 
-**Recommendation.** Do not rule one flat number. Rule the shape: the cut is set per pool, with a ceiling in code, lower where LP yield is close to what LPs can get elsewhere. I would start well-paid pools near 20% and thin pools near 10%. A cut that adjusts itself to a pool's yield is worth designing but has not been simulated.
+**A cut that sets itself (simulated after this list was first written).** Each week the pool looks at what its own fees yielded on its own depth, both numbers it can read from its books. The venue aims to take a set share of the yield above a reference rate written into config, and nothing of the yield below it. The cut stays between 5% and 40% and moves at most 5 points a week.
 
-**Spec impact.** §18.4 says "a small venue cut" with the size open. This sets it per pool and changes "small".
+Four markets: the two above, a volatile pair, and the thin pair during a fee war.
 
-`python3 -m sim.run --seeds 40 --set venue_cut_pct=20` (add `--scenario tight` for the thin pair)
+| Policy | Total the venue collects | Worst depth against the plain pool | Cut it settles at: well-paid / thin / volatile |
+|---|---|---|---|
+| Flat 10% | $159,027 | −8.1% | 10% / 10% / 10% |
+| Flat 20% | $310,072 | −11.8% | 20% / 20% / 20% |
+| Flat 30% | $448,707 | −26.1% | 30% / 30% / 30% |
+| Self-setting, takes 30% of the excess | $229,256 | −8.7% | 17% / 5% / 13% |
+| Self-setting, takes 50% of the excess | $365,810 | −10.8% | 29% / 5% / 21% |
+| Self-setting, takes 70% of the excess | $469,128 | −14.5% | 39% / 5% / 31% |
+
+- At each level the self-setting cut beats the flat one it is closest to: 18% more revenue than flat 20% with a better worst case, and more than flat 30% with a worst case of −14.5% against −26.1%.
+- In thin pools it falls to its floor, and the pool ends up 9% to 15% deeper than a plain pool charging a flat 10%.
+- The worst case is always the volatile pair, where seasoning alone costs about 8% of depth.
+
+**Recommendation.** Rule the self-setting cut. Leave three numbers OPEN: the share of excess it takes (I would start at 50%), the bounds, and the reference rate. The reference rate is the weak point: it has to be written into config per pool, and a rate set too low overcharges.
+
+**Spec impact.** §18.4 says "a small venue cut" with the size open, and step-ups on a published schedule. This replaces the schedule with a published rule, and changes "small". It also means the fee registry is no longer the only thing that moves a fee number; the rule's bounds sit in code.
+
+`python3 -m sim.run --seeds 40 --set auto_cut=1` (add `--scenario tight` or `volatile`; `--set cut_of_excess_pct=70` to vary the share; `--set venue_cut_pct=20` for a flat cut)
 
 ---
 

@@ -110,6 +110,17 @@ class ModelChecks(unittest.TestCase):
         loss = lambda p: 1 - run(p.but(fresh_depth_value=0.5))[0]["volume"] / run(p)[0]["volume"]
         self.assertGreater(loss(Params(days=90).plain()), loss(Params(days=90)))
 
+    def test_venue_cut_adjusts_itself_to_the_pool(self):
+        flat, _ = run(Params(days=120))
+        self.assertEqual((flat["cut_avg_pct"], flat["cut_end_pct"]), (10, 10))
+        rich, _ = run(Params(days=120, auto_cut=1))
+        thin, _ = run(Params(days=120, auto_cut=1).but(**SCENARIOS["tight"]))
+        # It rises where the pool pays well above the reference rate and falls where it does not.
+        self.assertGreater(rich["cut_end_pct"], 10)
+        self.assertLess(thin["cut_end_pct"], 10)
+        for r in (rich, thin):
+            self.assertTrue(5 <= r["cut_end_pct"] <= 40)
+
     def test_competitor_depth_follows_its_yield(self):
         fixed, _ = run(Params(days=120))
         self.assertEqual(fixed["rival_tvl_end"], Params().competitor_tvl)

@@ -48,7 +48,15 @@ class Params:
     fee_up_delay_days: int = 14      # timelock on a fee increase
     our_floor_mult: float = 0.4      # code bounds, as multiples of our day-one fee
     our_cap_mult: float = 1.0
-    venue_cut_pct: float = 10        # of the gross fee
+    venue_cut_pct: float = 10        # of the gross fee (the starting cut, if the cut adjusts itself)
+    auto_cut: int = 0                # 1: the cut adjusts itself each week to the pool's yield
+    cut_of_excess_pct: float = 50    # the venue aims to take this share of whatever the pool's fees yield
+                                     # above the reference rate, and nothing of the yield below it
+    reference_apr_pct: float = -1    # the yield LPs could get elsewhere, as written into config;
+                                     # -1 uses the average outside rate plus the expected loss to price moves
+    cut_min_pct: float = 5           # code bounds on the cut
+    cut_max_pct: float = 40
+    cut_step_pct: float = 5          # the most it can move in one week
     build_pct: float = 40            # pre-token split of the venue cut; the four lines sum to 100
     pol_pct: float = 20
     buyback_pct: float = 30
@@ -413,6 +421,8 @@ def run(p: Params):
             shock[f"{tag}_kept_{g}_pct"] = 100 * now / was if was else float("nan")
 
     lock_offered = [0.0, 0.0]   # capital that could have locked, and capital that did
+    cut = [p.venue_cut_pct, 0.0]   # the venue cut today, and gross fees since it was last reviewed
+    cut_days = []
 
     def lock_price(need, T):
         """What a lock costs an LP, as APR over their planned stay: the chance they
@@ -516,7 +526,8 @@ def run(p: Params):
             noise = math.exp(market.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
             volume = organic_volume(reliable()) / E * noise + arb
             gross = volume * live.gross_fee_pct / 100
-            venue = gross * p.venue_cut_pct / 100
+            venue = gross * cut[0] / 100
+            cut[1] += gross
             to_lockers = venue * p.lock_budget_pct / 100
             venue -= to_lockers
             buyback = venue * p.buyback_pct / 100
@@ -546,6 +557,16 @@ def run(p: Params):
             out["lp_fees"] += prize_pot
             prize_pot = 0.0
 
+        if p.auto_cut and day % 7 == 6:
+            # What the pool's fees have yielded over the past week, on its own depth.
+            # Both numbers are ones a contract can read from its own books.
+            gross_apr = cut[1] / 7 * 365 / tvl() * 100
+            reference = p.reference_apr_pct if p.reference_apr_pct >= 0 else p.outside_apr_pct + il_drag
+            want = p.cut_of_excess_pct * max(0.0, gross_apr - reference) / gross_apr if gross_apr else 0.0
+            want = max(p.cut_min_pct, min(p.cut_max_pct, want))
+            cut[0] += max(-p.cut_step_pct, min(p.cut_step_pct, want - cut[0]))
+            cut[1] = 0.0
+        cut_days.append(cut[0])
         if p.competitor_depth_speed:
             # Its LPs drift toward or away from it until they earn what they did before we arrived.
             ratio = market_seen[2] / rival_tvl / rival_yield_before
@@ -604,6 +625,8 @@ def run(p: Params):
     out["market_growth_pct"] = 100 * (market_seen[0] / (p.market_daily_volume * p.days) - 1)
     out["trading_cost_pct"] = 100 * market_seen[1] / market_seen[0]
     out["rival_fee_end"] = rival_fee
+    out["cut_avg_pct"] = sum(cut_days) / len(cut_days)
+    out["cut_end_pct"] = cut[0]
     out["our_fee_end"] = live.gross_fee_pct
     out["our_fee_avg"] = sum(our_fee_days) / len(our_fee_days)
     out["our_fee_changes"] = fee_changes

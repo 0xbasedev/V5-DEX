@@ -65,6 +65,7 @@ ROWS = [
     ("net_apr_medium", "Medium"),
     ("net_apr_hot", "Hot"),
     ("Venue ($)", None),
+    ("cut_avg_pct", "Venue cut, average (% of the fee)"),
     ("venue_cut", "Venue cut, all lines"),
     ("build", "Build fund"),
     ("pol_value", "POL owned"),
