@@ -45,7 +45,8 @@ class Params:
     # --- market (assumptions) ---
     days: int = 180
     epochs_per_day: int = 4
-    market_daily_volume: float = 15_000_000   # all trading in this pair, across venues
+    market_daily_volume: float = 15_000_000   # trading in this pair before we arrive, with the competitor alone
+    demand_elasticity: float = 1.0       # a 1% fall in the cost of trading adds this many % to trading; 0 fixes it
     competitor_tvl: float = 10_000_000   # the venue traders would otherwise use
     competitor_fee_pct: float = 0.05     # its fee on day one
     competitor_response: int = 0         # 0 never changes its fee
@@ -106,24 +107,42 @@ SCENARIOS = {
 _Z = [NormalDist().inv_cdf((i + 0.5) / 32) for i in range(32)]
 
 
-def our_share(p, tvl, competitor_tvl=None, competitor_fee_pct=None):
-    """Share of the pair's trading that routes to us.
+def route(p, tvl, competitor_tvl=None, competitor_fee_pct=None):
+    """How the pair's trading splits, and what it costs.
 
     Each trade is split between our pool and the competitor so that the last
     dollar costs the same in both (fee plus price impact), which is what an
     aggregator does. Small trades go wholly to the lower fee; large trades
     split by depth.
+
+    Returns (our share of the trading, average cost of a dollar traded).
     """
     r1 = tvl / 2 * p.depth_multiplier
     r2 = (p.competitor_tvl if competitor_tvl is None else competitor_tvl) / 2 * p.depth_multiplier
     f1 = p.gross_fee_pct / 100
     f2 = (p.competitor_fee_pct if competitor_fee_pct is None else competitor_fee_pct) / 100
-    ours = total = 0.0
+    ours = total = cost = 0.0
     for z in _Z:
         x = p.trade_median * math.exp(p.trade_sigma * z)
-        ours += min(x, max(0.0, r1 * (x + r2 * (f2 - f1)) / (r1 + r2)))
+        x1 = min(x, max(0.0, r1 * (x + r2 * (f2 - f1)) / (r1 + r2)))
+        x2 = x - x1
+        cost += f1 * x1 + f2 * x2 + (x1 * x1 / (2 * r1) if r1 else 0.0) + x2 * x2 / (2 * r2)
+        ours += x1
         total += x
-    return ours / total
+    return ours / total, cost / total
+
+
+def our_share(p, tvl, competitor_tvl=None, competitor_fee_pct=None):
+    return route(p, tvl, competitor_tvl, competitor_fee_pct)[0]
+
+
+def market_volume(p, cost):
+    """Daily trading in the pair at a given average cost. The reference point is
+    the competitor alone at its day-one fee, when trading is `market_daily_volume`."""
+    if not p.demand_elasticity:
+        return p.market_daily_volume
+    reference = route(p, 0.0)[1]
+    return p.market_daily_volume * (cost / reference) ** -p.demand_elasticity
 
 
 def competitor_reply(p, tvl, current_fee_pct):
@@ -137,7 +156,8 @@ def competitor_reply(p, tvl, current_fee_pct):
             fee = p.competitor_fee_pct * i / 20
             if fee < floor - 1e-12:
                 continue
-            income = fee * (1 - our_share(p, tvl, competitor_fee_pct=fee))
+            share, cost = route(p, tvl, competitor_fee_pct=fee)
+            income = fee * (1 - share) * market_volume(p, cost)
             if income > best_income * (1 + 1e-9):
                 best_fee, best_income = fee, income
         return best_fee
@@ -249,8 +269,14 @@ def run(p: Params):
     rival_fee = p.competitor_fee_pct
     rival_fee_days = []
 
+    market_seen = [0.0, 0.0]   # trading in the whole pair, and its cost weighted by that trading
+
     def organic_volume(depth):
-        return p.market_daily_volume * our_share(p, depth, competitor_fee_pct=rival_fee)
+        share, cost = route(p, depth, competitor_fee_pct=rival_fee)
+        market = market_volume(p, cost)
+        market_seen[0] += market / E
+        market_seen[1] += market / E * cost
+        return market * share
 
     def expected_apr(size, T, tier):
         """What a newcomer expects over a stay of T epochs if fees keep their recent pace."""
@@ -303,6 +329,7 @@ def run(p: Params):
 
     open_position("anchor", p.anchor_tvl, None)
     gross0 = organic_volume(tvl()) / E * p.gross_fee_pct / 100
+    market_seen[:] = [0.0, 0.0]
     rate = gross0 * (1 - p.venue_cut_pct / 100 * (1 - p.buyback_pct / 200))   # smoothed fees reaching the Hall per epoch
     smooth = 2 / (4 * E + 1)
 
@@ -419,7 +446,10 @@ def run(p: Params):
                   "kept_hard_mid", "kept_hard_done"):
             out[f"{tag}_{k}_pct"] = shock.get(f"{tag}_{k}_pct", float("nan"))
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
-    out["market_share_pct"] = 100 * out["volume"] / (p.market_daily_volume * p.days)
+    out["market_share_pct"] = 100 * out["volume"] / market_seen[0]
+    out["market_volume"] = market_seen[0]
+    out["market_growth_pct"] = 100 * (market_seen[0] / (p.market_daily_volume * p.days) - 1)
+    out["trading_cost_pct"] = 100 * market_seen[1] / market_seen[0]
     out["rival_fee_end"] = rival_fee
     out["rival_fee_avg"] = sum(rival_fee_days) / len(rival_fee_days)
 

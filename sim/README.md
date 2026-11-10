@@ -64,6 +64,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 
 - One pool. One share is one dollar on a stable pair. On a volatile pair the pool is 50/50, the price follows a random walk, and each LP's loss against simply holding is tracked.
 - Traders react to price. The pair has a fixed amount of trading per day across all venues. Each trade, drawn from a spread of sizes, is split between our pool and one competitor so that the last dollar costs the same in both, counting fee and price impact. That is what an aggregator does. Small trades go wholly to the lower fee; large trades split by depth. A stable pair trades with far less price impact, so its flow is far more sensitive to the fee.
+- Total trading responds to cost. Before we arrive the pair trades `market_daily_volume` a day with the competitor alone. A 1% fall in the average cost of a trade (fee plus price impact, across both venues) adds `demand_elasticity` percent to trading, 1.0 by default. So our depth grows the market, and higher fees anywhere shrink it. Set it to 0 to fix total trading.
 - Traders see the gross fee only. The venue cut sits inside it, so its cost shows up as lower LP yield and, through that, less depth.
 - `competitor_response` sets how the competitor behaves on fee. 0: it never changes. 1: it matches ours whenever ours is lower. 2: every week it moves to whichever fee earns it the most against ours. It first reacts after 14 days and never goes below 0.4 times its day-one fee. Its depth is fixed in every case, and our own fee never changes during a run.
 - A moving price adds the trading needed to keep the pool at the market price, less the moves too small to be worth arbitraging past the fee.
@@ -76,7 +77,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - The prize slice is paid to the Hall every 30 days as ordinary fees, which approximates "by seasoned weight over the month".
 - Pre-token only: half the buyback line goes to LPs, half is banked up to the holding cap.
 
-Not modelled yet: a competitor whose depth changes, our own fee responding in turn, total trading that grows or shrinks with cost, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
+Not modelled yet: a competitor whose depth changes, our own fee responding in turn, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
 
 ## Reading the output
 

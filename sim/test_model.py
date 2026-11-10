@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from .model import Params, SCENARIOS, competitor_reply, our_share, run
+from .model import Params, SCENARIOS, competitor_reply, market_volume, our_share, route, run
 
 
 class ModelChecks(unittest.TestCase):
@@ -49,6 +49,20 @@ class ModelChecks(unittest.TestCase):
             split, _ = run(base.but(toll_mode=0))
             self.assertLess(out["pol_value"], split["pol_value"])
 
+    def test_trading_responds_to_cost(self):
+        p = Params()
+        alone = route(p, 0.0)[1]
+        self.assertAlmostEqual(market_volume(p, alone), p.market_daily_volume)
+        # Our depth makes trading cheaper, so there is more of it.
+        with_us = route(p, 5_000_000)[1]
+        self.assertLess(with_us, alone)
+        self.assertGreater(market_volume(p, with_us), p.market_daily_volume)
+        # Dearer trading means less of it, and more so the more elastic demand is.
+        dear = route(p.but(gross_fee_pct=0.2, competitor_fee_pct=0.2), 5_000_000)[1]
+        self.assertLess(market_volume(p, dear), market_volume(p, with_us))
+        self.assertLess(market_volume(p.but(demand_elasticity=2), dear), market_volume(p, dear))
+        self.assertEqual(market_volume(p.but(demand_elasticity=0), dear), p.market_daily_volume)
+
     def test_competitor_replies(self):
         p = Params(gross_fee_pct=0.04)
         self.assertEqual(competitor_reply(p, 5e6, 0.05), 0.05)                              # static
@@ -56,7 +70,9 @@ class ModelChecks(unittest.TestCase):
         self.assertEqual(competitor_reply(p.but(competitor_response=1, gross_fee_pct=0.07), 5e6, 0.05), 0.05)
         self.assertAlmostEqual(competitor_reply(p.but(competitor_response=1, gross_fee_pct=0.01), 5e6, 0.05), 0.02)  # floor
         best = competitor_reply(p.but(competitor_response=2), 5e6, 0.05)
-        income = lambda fee: fee * (1 - our_share(p, 5e6, competitor_fee_pct=fee))
+        def income(fee):
+            share, cost = route(p, 5e6, competitor_fee_pct=fee)
+            return fee * (1 - share) * market_volume(p, cost)
         self.assertGreaterEqual(income(best), income(0.05))
         self.assertGreaterEqual(best, 0.02 - 1e-12)
         # In a full run the matching competitor ends on our fee.
