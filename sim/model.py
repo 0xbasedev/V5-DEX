@@ -7,6 +7,7 @@ Every default in `Params` is a placeholder to be swept, not a ruling.
 import math
 import random
 from dataclasses import dataclass, asdict
+from statistics import NormalDist
 
 from .hall import AccHall, ramp
 
@@ -40,9 +41,12 @@ class Params:
     # --- market (assumptions) ---
     days: int = 180
     epochs_per_day: int = 4
-    volume_at_ref: float = 2_000_000     # organic daily volume when TVL equals tvl_ref
-    tvl_ref: float = 1_000_000
-    depth_elasticity: float = 0.6        # organic volume grows with TVL to this power
+    market_daily_volume: float = 15_000_000   # all trading in this pair, across venues
+    competitor_tvl: float = 10_000_000   # the venue traders would otherwise use
+    competitor_fee_pct: float = 0.05
+    trade_median: float = 5_000          # trade sizes are lognormal
+    trade_sigma: float = 1.5
+    depth_multiplier: float = 50         # how much deeper than 50/50 the curve trades; 1 for a volatile pair
     volume_sigma: float = 0.35           # per-epoch noise
     anchor_tvl: float = 500_000          # anchor tenants, in from day one and never leaving
     annual_vol_pct: float = 0            # price volatility of the pair; 0 is a stable pair
@@ -76,13 +80,37 @@ class Params:
         return self.but(floor=1.0, u0=1.0, principal_floor_pct=0.0, hard_lock_days=0)
 
 
+_VOLATILE = dict(annual_vol_pct=70, gross_fee_pct=0.30, competitor_fee_pct=0.30, depth_multiplier=1,
+                 market_daily_volume=2_500_000)
+
 SCENARIOS = {
     "stable": dict(),
-    "tight": dict(volume_at_ref=450_000),
-    "volatile": dict(annual_vol_pct=70, gross_fee_pct=0.30, volume_at_ref=300_000),
-    "shock": dict(annual_vol_pct=70, gross_fee_pct=0.30, volume_at_ref=300_000, shock_day=90),
-    "hardlock": dict(annual_vol_pct=70, gross_fee_pct=0.30, volume_at_ref=300_000, shock_day=90, hard_lock_days=90),
+    "tight": dict(market_daily_volume=4_000_000),
+    "volatile": dict(_VOLATILE),
+    "shock": dict(_VOLATILE, shock_day=90),
+    "hardlock": dict(_VOLATILE, shock_day=90, hard_lock_days=90),
 }
+
+_Z = [NormalDist().inv_cdf((i + 0.5) / 32) for i in range(32)]
+
+
+def our_share(p, tvl, competitor_tvl=None):
+    """Share of the pair's trading that routes to us.
+
+    Each trade is split between our pool and the competitor so that the last
+    dollar costs the same in both (fee plus price impact), which is what an
+    aggregator does. Small trades go wholly to the lower fee; large trades
+    split by depth.
+    """
+    r1 = tvl / 2 * p.depth_multiplier
+    r2 = (p.competitor_tvl if competitor_tvl is None else competitor_tvl) / 2 * p.depth_multiplier
+    f1, f2 = p.gross_fee_pct / 100, p.competitor_fee_pct / 100
+    ours = total = 0.0
+    for z in _Z:
+        x = p.trade_median * math.exp(p.trade_sigma * z)
+        ours += min(x, max(0.0, r1 * (x + r2 * (f2 - f1)) / (r1 + r2)))
+        total += x
+    return ours / total
 
 
 def _poisson(rng, lam):
@@ -118,7 +146,7 @@ def run(p: Params):
     done = []     # dict per finished or still-open position
     shares = 0.0  # real shares in the pool; weight boosts live only in the Hall
     out = dict(volume=0.0, lp_fees=0.0, build=0.0, banked=0.0, bank_overflow_to_lps=0.0,
-               forfeited_fees=0.0, principal_tolls=0.0)
+               forfeited_fees=0.0, principal_tolls=0.0, venue_cut=0.0)
     offered = {k: 0.0 for k in KINDS}
     accepted = {k: 0.0 for k in KINDS}
     late = [0.0, 0.0]   # long capital offered and accepted in the second half
@@ -157,7 +185,7 @@ def run(p: Params):
         done.append(dict(m, t=age, fees=cash - toll, il=price_loss(m)))
 
     def organic_volume(depth):
-        return p.volume_at_ref * (depth / p.tvl_ref) ** p.depth_elasticity
+        return p.market_daily_volume * our_share(p, depth)
 
     def expected_apr(size, T, tier):
         """What a newcomer expects over a stay of T epochs if fees keep their recent pace."""
@@ -250,7 +278,9 @@ def run(p: Params):
             if volatile:
                 step = sig * rng.gauss(0, 1) - sig * sig / 2
                 price *= math.exp(step)
-                arb = abs(step) * tvl() / 4   # trading needed to move a 50/50 pool to the new price
+                # Trading needed to move a 50/50 pool to the new price. Moves smaller
+                # than the fee are not worth arbitraging.
+                arb = max(0.0, abs(step) - p.gross_fee_pct / 100) * tvl() / 4
             noise = math.exp(rng.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
             volume = organic_volume(tvl()) / E * noise + arb
             gross = volume * p.gross_fee_pct / 100
@@ -261,6 +291,7 @@ def run(p: Params):
             hall.add_fees(to_hall)
             hall.add_bank(to_bank)
             out["volume"] += volume
+            out["venue_cut"] += venue
             out["lp_fees"] += to_hall
             out["banked"] += to_bank
             out["bank_overflow_to_lps"] += buyback / 2 - to_bank
@@ -308,6 +339,7 @@ def run(p: Params):
               "shock_kept_fresh_pct", "shock_kept_hard_pct", "shock_kept_soft_pct"):
         out[k] = shock.get(k, float("nan"))
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
+    out["market_share_pct"] = 100 * out["volume"] / (p.market_daily_volume * p.days)
 
     # Growth-trap probe: over one horizon starting mid-run, what does a brand-new
     # dollar earn compared with a fully seasoned one?

@@ -4,6 +4,7 @@
   python3 -m sim.run --scenario shock      stable | tight | volatile | shock | hardlock
   python3 -m sim.run --set floor=0.6 --set horizon_days=14
   python3 -m sim.run --sweep               floor x horizon grid, written to sim/out/sweep-<scenario>.csv
+  python3 -m sim.run --sweep fees          gross fee x venue cut grid, written to sim/out/fees-<scenario>.csv
   python3 -m sim.run --seeds 20            average over more random runs
 """
 
@@ -20,6 +21,7 @@ ROWS = [
     ("tvl_end", "TVL at the end ($)"),
     ("seasoned_share_pct", "TVL that is fully seasoned (%)"),
     ("volume", "Volume ($)"),
+    ("market_share_pct", "Share of the pair's trading (%)"),
     ("hard_share_pct", "TVL that is hard-locked (%)"),
     ("At the shock", None),
     ("shock_seasoned_mix_pct", "LP capital that was fully seasoned (%)"),
@@ -46,6 +48,7 @@ ROWS = [
     ("net_apr_medium", "Medium"),
     ("net_apr_hot", "Hot"),
     ("Venue ($)", None),
+    ("venue_cut", "Venue cut, all lines"),
     ("build", "Build fund"),
     ("pol_value", "POL owned"),
     ("pol_income", "Fees earned by POL"),
@@ -90,6 +93,29 @@ def scenario(p, seeds, name):
             print(f"  {label:48}{cell(key, a, ea):>14}{cell(key, b, eb):>14}")
 
 
+def sweep_fees(p, seeds, name):
+    """Gross fee (as a multiple of the competitor's) by venue cut."""
+    multiples = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0]
+    cuts = [0, 5, 10, 20, 30, 40]
+    cols = ["tvl_avg", "volume", "market_share_pct", "apr_long", "venue_cut"]
+    os.makedirs("sim/out", exist_ok=True)
+    path = f"sim/out/fees-{name}.csv"
+    print(f"{'fee %':>7}{'cut %':>7}" + "".join(f"{c:>20}" for c in cols))
+    with open(path, "w", newline="") as fh:
+        writer = None
+        for mult in multiples:
+            fee = round(p.competitor_fee_pct * mult, 4)
+            for cut in cuts:
+                r = average(p.but(gross_fee_pct=fee, venue_cut_pct=cut), seeds)
+                row = dict(gross_fee_pct=fee, venue_cut_pct=cut, **r)
+                if writer is None:
+                    writer = csv.DictWriter(fh, fieldnames=list(row))
+                    writer.writeheader()
+                writer.writerow(row)
+                print(f"{fee:>7g}{cut:>7}" + "".join(f"{fmt(c, r[c]):>20}" for c in cols))
+    print(f"\nFull results: {path}  (the competitor charges {p.competitor_fee_pct:g}%)")
+
+
 def sweep(p, seeds, name):
     floors = [0.2, 0.4, 0.6, 0.8, 1.0]
     horizons = [7, 14, 28, 56]
@@ -114,10 +140,11 @@ def sweep(p, seeds, name):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--sweep", nargs="?", const="seasoning", choices=["seasoning", "fees"])
     ap.add_argument("--scenario", choices=sorted(SCENARIOS), default="stable")
     ap.add_argument("--seeds", type=int, default=8)
     ap.add_argument("--set", action="append", default=[], metavar="name=value")
     args = ap.parse_args()
     params = Params().but(**SCENARIOS[args.scenario]).but(**parse_sets(args.set))
-    (sweep if args.sweep else scenario)(params, args.seeds, args.scenario)
+    job = {"seasoning": sweep, "fees": sweep_fees, None: scenario}[args.sweep]
+    job(params, args.seeds, args.scenario)

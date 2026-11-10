@@ -8,6 +8,7 @@ python3 -m unittest sim.test_model       # sanity checks on the scenario model
 python3 -m sim.run                       # the stable scenario against a plain pool
 python3 -m sim.run --scenario shock      # stable | tight | volatile | shock | hardlock
 python3 -m sim.run --sweep               # floor x horizon grid -> sim/out/sweep-<scenario>.csv
+python3 -m sim.run --sweep fees          # gross fee x venue cut grid -> sim/out/fees-<scenario>.csv
 python3 -m sim.run --set floor=0.6 --set horizon_days=14 --seeds 20
 ```
 
@@ -61,7 +62,10 @@ Any parameter can be overridden with `--set name=value`, and `--sweep` works wit
 The scenario numbers are only as good as these. All are parameters in `model.py`.
 
 - One pool. One share is one dollar on a stable pair. On a volatile pair the pool is 50/50, the price follows a random walk, and each LP's loss against simply holding is tracked.
-- Organic volume grows with depth (to the power 0.6 by default) with random noise. A moving price adds the trading needed to keep the pool at the market price.
+- Traders react to price. The pair has a fixed amount of trading per day across all venues. Each trade, drawn from a spread of sizes, is split between our pool and one competitor so that the last dollar costs the same in both, counting fee and price impact. That is what an aggregator does. Small trades go wholly to the lower fee; large trades split by depth. A stable pair trades with far less price impact, so its flow is far more sensitive to the fee.
+- Traders see the gross fee only. The venue cut sits inside it, so its cost shows up as lower LP yield and, through that, less depth.
+- The competitor never reacts: its fee and depth are fixed.
+- A moving price adds the trading needed to keep the pool at the market price, less the moves too small to be worth arbitraging past the fee.
 - LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate, plus the expected loss to price moves. They leave when their planned stay ends.
 - In a shock, 60% of LPs do nothing. Each of the rest fears losing up to 5% of their position and leaves if that fear is larger than what leaving costs them.
 - A hard-locked position seasons on the same ramp with a weight multiplier, and pays a share of principal to leave early that melts to zero over the term. An LP takes the lock only if it plans to stay the whole term and the lock pays enough more.
@@ -70,7 +74,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - The prize slice is paid to the Hall every 30 days as ordinary fees, which approximates "by seasoned weight over the month".
 - Pre-token only: half the buyback line goes to LPs, half is banked up to the holding cap.
 
-Not modelled yet: the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
+Not modelled yet: a competitor that responds, total trading that grows or shrinks with cost, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
 
 ## Reading the output
 

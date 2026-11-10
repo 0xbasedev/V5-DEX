@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from .model import Params, SCENARIOS, run
+from .model import Params, SCENARIOS, our_share, run
 
 
 class ModelChecks(unittest.TestCase):
@@ -19,6 +19,24 @@ class ModelChecks(unittest.TestCase):
         self.assertEqual(out["forfeited_fees"], 0)
         self.assertEqual(out["principal_tolls"], 0)
         self.assertAlmostEqual(out["new_vs_mature_pct"], 100)
+
+    def test_traders_follow_fee_and_depth(self):
+        p = Params()
+        # Same fee: flow splits by depth.
+        self.assertAlmostEqual(our_share(p, 10_000_000), 0.5)
+        self.assertAlmostEqual(our_share(p, 5_000_000), 1 / 3)
+        # A higher fee loses flow, a lower fee wins it, and more depth always helps.
+        shares = [our_share(p.but(gross_fee_pct=f), 5_000_000) for f in (0.03, 0.05, 0.07, 0.2)]
+        self.assertEqual(shares, sorted(shares, reverse=True))
+        self.assertGreater(shares[0], 1 / 3)
+        self.assertLess(shares[2], 1 / 3)
+        self.assertLess(our_share(p.but(gross_fee_pct=0.07), 5_000_000),
+                        our_share(p.but(gross_fee_pct=0.07), 8_000_000))
+        # A volatile pair has more price impact, so the same fee gap moves less flow.
+        v = p.but(depth_multiplier=1, competitor_fee_pct=0.30)
+        stable_loss = 1 / 3 - shares[2]
+        volatile_loss = 1 / 3 - our_share(v.but(gross_fee_pct=0.42), 5_000_000)
+        self.assertLess(volatile_loss, stable_loss)
 
     def test_same_seed_same_result(self):
         p = Params(days=60, seed=7).but(**SCENARIOS["hardlock"]).but(shock_day=30)
