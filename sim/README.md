@@ -65,7 +65,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - One pool. One share is one dollar on a stable pair. On a volatile pair the pool is 50/50, the price follows a random walk, and each LP's loss against simply holding is tracked.
 - Traders react to price. The pair has a fixed amount of trading per day across all venues. Each trade, drawn from a spread of sizes, is split between our pool and one competitor so that the last dollar costs the same in both, counting fee and price impact. That is what an aggregator does. Small trades go wholly to the lower fee; large trades split by depth. A stable pair trades with far less price impact, so its flow is far more sensitive to the fee.
 - Traders see the gross fee only. The venue cut sits inside it, so its cost shows up as lower LP yield and, through that, less depth.
-- The competitor never reacts: its fee and depth are fixed.
+- `competitor_response` sets how the competitor behaves on fee. 0: it never changes. 1: it matches ours whenever ours is lower. 2: every week it moves to whichever fee earns it the most against ours. It first reacts after 14 days and never goes below 0.4 times its day-one fee. Its depth is fixed in every case, and our own fee never changes during a run.
 - A moving price adds the trading needed to keep the pool at the market price, less the moves too small to be worth arbitraging past the fee.
 - LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate, plus the expected loss to price moves. They leave when their planned stay ends.
 - In a shock, 60% of LPs do nothing. Each of the rest fears losing up to 5% of their position and leaves if that fear is larger than what leaving costs them.
@@ -76,7 +76,7 @@ The scenario numbers are only as good as these. All are parameters in `model.py`
 - The prize slice is paid to the Hall every 30 days as ordinary fees, which approximates "by seasoned weight over the month".
 - Pre-token only: half the buyback line goes to LPs, half is banked up to the holding cap.
 
-Not modelled yet: a competitor that responds, total trading that grows or shrinks with cost, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
+Not modelled yet: a competitor whose depth changes, our own fee responding in turn, total trading that grows or shrinks with cost, the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
 
 ## Reading the output
 

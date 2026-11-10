@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from .model import Params, SCENARIOS, our_share, run
+from .model import Params, SCENARIOS, competitor_reply, our_share, run
 
 
 class ModelChecks(unittest.TestCase):
@@ -48,6 +48,20 @@ class ModelChecks(unittest.TestCase):
             # POL received only its fee line and its share of forfeited fees: no toll money.
             split, _ = run(base.but(toll_mode=0))
             self.assertLess(out["pol_value"], split["pol_value"])
+
+    def test_competitor_replies(self):
+        p = Params(gross_fee_pct=0.04)
+        self.assertEqual(competitor_reply(p, 5e6, 0.05), 0.05)                              # static
+        self.assertEqual(competitor_reply(p.but(competitor_response=1), 5e6, 0.05), 0.04)   # matches down
+        self.assertEqual(competitor_reply(p.but(competitor_response=1, gross_fee_pct=0.07), 5e6, 0.05), 0.05)
+        self.assertAlmostEqual(competitor_reply(p.but(competitor_response=1, gross_fee_pct=0.01), 5e6, 0.05), 0.02)  # floor
+        best = competitor_reply(p.but(competitor_response=2), 5e6, 0.05)
+        income = lambda fee: fee * (1 - our_share(p, 5e6, competitor_fee_pct=fee))
+        self.assertGreaterEqual(income(best), income(0.05))
+        self.assertGreaterEqual(best, 0.02 - 1e-12)
+        # In a full run the matching competitor ends on our fee.
+        out, _ = run(Params(days=60, gross_fee_pct=0.04, competitor_response=1))
+        self.assertAlmostEqual(out["rival_fee_end"], 0.04)
 
     def test_same_seed_same_result(self):
         p = Params(days=60, seed=7).but(**SCENARIOS["hardlock"]).but(shock_day=30)

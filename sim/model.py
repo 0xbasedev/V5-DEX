@@ -47,7 +47,13 @@ class Params:
     epochs_per_day: int = 4
     market_daily_volume: float = 15_000_000   # all trading in this pair, across venues
     competitor_tvl: float = 10_000_000   # the venue traders would otherwise use
-    competitor_fee_pct: float = 0.05
+    competitor_fee_pct: float = 0.05     # its fee on day one
+    competitor_response: int = 0         # 0 never changes its fee
+                                         # 1 matches ours whenever ours is lower
+                                         # 2 picks whichever fee earns it the most against ours
+    competitor_delay_days: int = 14      # how long before it first reacts
+    competitor_review_days: int = 7      # how often it reconsiders after that
+    competitor_floor_mult: float = 0.4   # it never goes below this multiple of its day-one fee
     trade_median: float = 5_000          # trade sizes are lognormal
     trade_sigma: float = 1.5
     depth_multiplier: float = 50         # how much deeper than 50/50 the curve trades; 1 for a volatile pair
@@ -100,7 +106,7 @@ SCENARIOS = {
 _Z = [NormalDist().inv_cdf((i + 0.5) / 32) for i in range(32)]
 
 
-def our_share(p, tvl, competitor_tvl=None):
+def our_share(p, tvl, competitor_tvl=None, competitor_fee_pct=None):
     """Share of the pair's trading that routes to us.
 
     Each trade is split between our pool and the competitor so that the last
@@ -110,13 +116,32 @@ def our_share(p, tvl, competitor_tvl=None):
     """
     r1 = tvl / 2 * p.depth_multiplier
     r2 = (p.competitor_tvl if competitor_tvl is None else competitor_tvl) / 2 * p.depth_multiplier
-    f1, f2 = p.gross_fee_pct / 100, p.competitor_fee_pct / 100
+    f1 = p.gross_fee_pct / 100
+    f2 = (p.competitor_fee_pct if competitor_fee_pct is None else competitor_fee_pct) / 100
     ours = total = 0.0
     for z in _Z:
         x = p.trade_median * math.exp(p.trade_sigma * z)
         ours += min(x, max(0.0, r1 * (x + r2 * (f2 - f1)) / (r1 + r2)))
         total += x
     return ours / total
+
+
+def competitor_reply(p, tvl, current_fee_pct):
+    """The fee the competitor moves to when it reconsiders."""
+    floor = p.competitor_fee_pct * p.competitor_floor_mult
+    if p.competitor_response == 1:
+        return max(floor, min(current_fee_pct, p.gross_fee_pct))
+    if p.competitor_response == 2:
+        best_fee, best_income = current_fee_pct, -1.0
+        for i in range(8, 41):   # 0.40x to 2.00x its day-one fee, in steps of 0.05x
+            fee = p.competitor_fee_pct * i / 20
+            if fee < floor - 1e-12:
+                continue
+            income = fee * (1 - our_share(p, tvl, competitor_fee_pct=fee))
+            if income > best_income * (1 + 1e-9):
+                best_fee, best_income = fee, income
+        return best_fee
+    return current_fee_pct
 
 
 def _poisson(rng, lam):
@@ -221,8 +246,11 @@ def run(p: Params):
         out["principal_tolls"] += toll
         done.append(dict(m, t=age, fees=cash - toll + got, il=price_loss(m)))
 
+    rival_fee = p.competitor_fee_pct
+    rival_fee_days = []
+
     def organic_volume(depth):
-        return p.market_daily_volume * our_share(p, depth)
+        return p.market_daily_volume * our_share(p, depth, competitor_fee_pct=rival_fee)
 
     def expected_apr(size, T, tier):
         """What a newcomer expects over a stay of T epochs if fees keep their recent pace."""
@@ -279,6 +307,10 @@ def run(p: Params):
     smooth = 2 / (4 * E + 1)
 
     for day in range(p.days):
+        if (p.competitor_response and day >= p.competitor_delay_days
+                and (day - p.competitor_delay_days) % p.competitor_review_days == 0):
+            rival_fee = competitor_reply(p, tvl(), rival_fee)
+        rival_fee_days.append(rival_fee)
         if day == p.shock_day:
             run_shock("shock")
         if day == p.shock_day2:
@@ -388,6 +420,8 @@ def run(p: Params):
             out[f"{tag}_{k}_pct"] = shock.get(f"{tag}_{k}_pct", float("nan"))
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
     out["market_share_pct"] = 100 * out["volume"] / (p.market_daily_volume * p.days)
+    out["rival_fee_end"] = rival_fee
+    out["rival_fee_avg"] = sum(rival_fee_days) / len(rival_fee_days)
 
     # Growth-trap probe: over one horizon starting mid-run, what does a brand-new
     # dollar earn compared with a fully seasoned one?

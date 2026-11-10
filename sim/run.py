@@ -22,6 +22,7 @@ ROWS = [
     ("seasoned_share_pct", "TVL that is fully seasoned (%)"),
     ("volume", "Volume ($)"),
     ("market_share_pct", "Share of the pair's trading (%)"),
+    ("rival_fee_end", "Competitor's fee at the end (%)"),
     ("hard_share_pct", "TVL that is hard-locked (%)"),
     ("At the shock", None),
     ("shock_seasoned_mix_pct", "LP capital that was fully seasoned (%)"),
@@ -68,6 +69,8 @@ ROWS = [
 def fmt(key, v):
     if v != v:
         return "n/a"
+    if key.startswith("rival_fee"):
+        return f"{v:.4f}"
     return f"{v:,.1f}" if key.endswith("_pct") or "apr_" in key else f"{v:,.0f}"
 
 
@@ -103,11 +106,11 @@ def scenario(p, seeds, name):
 def sweep_fees(p, seeds, name):
     """Gross fee (as a multiple of the competitor's) by venue cut."""
     multiples = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0]
-    cuts = [0, 5, 10, 20, 30, 40]
-    cols = ["tvl_avg", "volume", "market_share_pct", "apr_long", "venue_cut"]
+    cuts = [10, 20, 40]
+    cols = ["tvl_avg", "volume", "market_share_pct", "rival_fee_end", "apr_long", "lp_fees", "venue_cut"]
     os.makedirs("sim/out", exist_ok=True)
     path = f"sim/out/fees-{name}.csv"
-    print(f"{'fee %':>7}{'cut %':>7}" + "".join(f"{c:>20}" for c in cols))
+    print(f"{'fee %':>7}{'cut %':>7}" + "".join(f"{c:>18}" for c in cols))
     with open(path, "w", newline="") as fh:
         writer = None
         for mult in multiples:
@@ -119,8 +122,9 @@ def sweep_fees(p, seeds, name):
                     writer = csv.DictWriter(fh, fieldnames=list(row))
                     writer.writeheader()
                 writer.writerow(row)
-                print(f"{fee:>7g}{cut:>7}" + "".join(f"{fmt(c, r[c]):>20}" for c in cols))
-    print(f"\nFull results: {path}  (the competitor charges {p.competitor_fee_pct:g}%)")
+                print(f"{fee:>7g}{cut:>7}" + "".join(f"{fmt(c, r[c]):>18}" for c in cols))
+    how = ["never changes it", "matches a lower fee", "picks its best reply"][p.competitor_response]
+    print(f"\nFull results: {path}  (the competitor starts at {p.competitor_fee_pct:g}% and {how})")
 
 
 def sweep(p, seeds, name):
