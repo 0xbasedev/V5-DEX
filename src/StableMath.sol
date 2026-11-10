@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity 0.8.28;
 
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
+
 /// @title StableMath
 /// @notice The amplified invariant for a two-token peg pair (spec v1.16 §3, "curve modes").
 ///
@@ -50,6 +52,16 @@ library StableMath {
             if (y > prev ? y - prev <= 1 : prev - y <= 1) return y;
         }
         revert DidNotConverge();
+    }
+
+    /// The marginal price of x in units of y, scaled by 1e18: how much y the
+    /// next sliver of x buys. It is the ratio of the invariant's two slopes,
+    /// (2A + D^3/(4x^2 y)) / (2A + D^3/(4x y^2)).
+    function price(uint256 x, uint256 y, uint256 amp) internal pure returns (uint256) {
+        uint256 d = invariant(x, y, amp);
+        uint256 ann = amp * 2;
+        uint256 dp = d * d / (x * 2) * d / (y * 2);
+        return FixedPointMathLib.fullMulDiv((ann * x + dp) * y, 1e18, (ann * y + dp) * x);
     }
 
     /// What `amountIn` buys, with both balances and the result in the common scale.

@@ -10,6 +10,22 @@ interface IDecimals {
     function decimals() external view returns (uint8);
 }
 
+/// A fee that depends on where the trade takes the price. The pool hands it
+/// the fee in force and the pool's price before the trade, half way through
+/// it and after it, and charges whatever rate comes back, up to the ceiling.
+/// It is consulted on swaps only and can never stand in the way of an exit.
+interface IFeeModel {
+    function feeFor(uint256 baseFeeWad, uint256 priceBefore, uint256 priceMid, uint256 priceAfter)
+        external
+        view
+        returns (uint256);
+}
+
+/// Says whether an outside reference has been off its peg for long enough.
+interface IDepegWatch {
+    function depegged() external view returns (bool);
+}
+
 /// @title V5Pool
 /// @notice A two-token pool whose liquidity is held as seasoned positions
 /// (spec v1.16 §3). The curve is weighted for general pairs, or amplified for
@@ -50,6 +66,7 @@ contract V5Pool is EpochHall {
         address configurer; // may change settings
         address feeSetter; // may queue a fee change inside the bounds
         address bank; // the escrow; may record what it has banked for this pool
+        address depegWatch; // optional; while it reports a depeg, exits are free
     }
 
     struct FeePolicy {
@@ -71,6 +88,8 @@ contract V5Pool is EpochHall {
         uint256 cutReview;
         /// Share of the venue cut paid to locked LPs (WAD).
         uint256 lockBudgetWad;
+        /// An optional fee model, such as the tuning fork. Zero means the plain fee.
+        address feeModel;
     }
 
     Roles internal _roles;
@@ -242,7 +261,7 @@ contract V5Pool is EpochHall {
     {
         if (ownerOf(id) != msg.sender) revert NotOwner();
         _current();
-        (, uint256 shares, uint256 toll) = _close(id, paused);
+        (, uint256 shares, uint256 toll) = _close(id, paused || _depegged());
 
         uint256 total = totalShares;
         out0 = (shares - toll) * reserves[0] / total;
@@ -392,11 +411,29 @@ contract V5Pool is EpochHall {
     }
 
     function _quote(uint256 i, uint256 amountIn) private view returns (uint256 amountOut, uint256 fee) {
-        fee = amountIn.mulWadUp(feeWad());
-        uint256 net = amountIn - fee;
+        if (amountIn > reserves[i].mulWad(MAX_IN_RATIO)) revert TooMuchIn();
+        uint256 rate = feeWad();
+        address model = _feePolicy.feeModel;
+        if (model != address(0)) {
+            // Where the trade would take the price, measured without the fee.
+            uint256 half = amountIn / 2;
+            rate = IFeeModel(model)
+                .feeFor(
+                    rate,
+                    _price(i, 0, 0),
+                    _price(i, half, _curveOut(i, half)),
+                    _price(i, amountIn, _curveOut(i, amountIn))
+                );
+            if (rate > FEE_CEILING) rate = FEE_CEILING;
+        }
+        fee = amountIn.mulWadUp(rate);
+        amountOut = _curveOut(i, amountIn - fee);
+    }
+
+    /// What `net` of token `i` buys from the curve, before any fee. Rounded against the trader.
+    function _curveOut(uint256 i, uint256 net) private view returns (uint256 amountOut) {
         uint256 rIn = reserves[i];
         uint256 rOut = reserves[1 - i];
-        if (net > rIn.mulWad(MAX_IN_RATIO)) revert TooMuchIn();
         (uint256 wIn, uint256 wOut) = i == 0 ? (weight0, weight1) : (weight1, weight0);
         if (amp != 0) {
             // The amplified curve works in a common 18-decimal scale.
@@ -410,6 +447,33 @@ contract V5Pool is EpochHall {
             uint256 power = uint256(FixedPointMathLib.powWad(int256(base), int256(wIn.divWad(wOut))));
             power += power / 1e14 + 1; // more than the power function's error
             amountOut = power >= WAD ? 0 : rOut.mulWad(WAD - power);
+        }
+    }
+
+    /// The pool's price, token1 per token0 scaled by 1e18, as it would stand
+    /// after `added` of token `i` came in and `removed` of the other went out.
+    /// A peg pair's price is in a common 18-decimal scale, so it reads 1e18 at the peg.
+    function _price(uint256 i, uint256 added, uint256 removed) private view returns (uint256) {
+        (uint256 r0, uint256 r1) =
+            i == 0 ? (reserves[0] + added, reserves[1] - removed) : (reserves[0] - removed, reserves[1] + added);
+        if (amp != 0) return StableMath.price(r0 * _scale0, r1 * _scale1, amp);
+        return FixedPointMathLib.fullMulDiv(r1 * weight0, WAD, r0 * weight1);
+    }
+
+    /// The pool's price now: token1 per token0, scaled by 1e18.
+    function price() external view returns (uint256) {
+        return _price(0, 0, 0);
+    }
+
+    /// True while the depeg watch, if there is one, reports a depeg. A watch
+    /// that fails to answer counts as no depeg; it can never block an exit.
+    function _depegged() private view returns (bool) {
+        address watch = _roles.depegWatch;
+        if (watch == address(0)) return false;
+        try IDepegWatch(watch).depegged() returns (bool yes) {
+            return yes;
+        } catch {
+            return false;
         }
     }
 

@@ -5,6 +5,8 @@ import {EpochHall} from "./EpochHall.sol";
 import {V5Pool} from "./V5Pool.sol";
 import {VenueSplitter} from "./VenueSplitter.sol";
 import {BankEscrow} from "./BankEscrow.sol";
+import {TuningFork} from "./TuningFork.sol";
+import {DepegWatch} from "./DepegWatch.sol";
 
 /// @title Defaults
 /// @notice The settings a new V5 pool starts with.
@@ -101,6 +103,27 @@ library Defaults {
         l.stuckPeriod = deployDelay + l.unpauseDelay + 14 days;
         l.threshold = 3;
         l.memberFloor = 3;
+    }
+
+    /// The tuning fork for a peg pair. Not from a run: the simulator does not
+    /// model it. Half the base fee toward the pitch, as the spec's "cheapest
+    /// toward" suggests; away from it, a tenth of a percent of fee for each
+    /// percent of detune, up to 1%.
+    function fork(uint256 pitchWad) internal pure returns (TuningFork.Policy memory p) {
+        p.pitchWad = pitchWad;
+        p.towardWad = 0.5e18;
+        p.slopeWad = 0.1e18;
+        p.capWad = 0.01e18;
+    }
+
+    /// The depeg watch. Not from a run. On the peg within 2%; a depeg takes a
+    /// full day outside with readings no more than six hours apart.
+    function depegWatch(address source, uint256 pegWad) internal pure returns (DepegWatch.Settings memory w) {
+        w.source = source;
+        w.pegWad = pegWad;
+        w.toleranceWad = 0.02e18;
+        w.window = 1 days;
+        w.maxGap = 6 hours;
     }
 
     /// The longest timelock: how long a queued deploy waits. Not from a run.

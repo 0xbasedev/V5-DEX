@@ -15,6 +15,8 @@ pnpm test:sim         # the simulator's own tests
 | `EpochHall.sol` | Seasoned-position bookkeeping: the weight ramp, constant-time fee settlement, the fee hold, forfeits on early exit, the hard lock and its toll, tolls paid to lockers, transfer and merge. A Solidity port of `sim/hall.py`. |
 | `StableMath.sol` | The amplified curve for peg pairs. |
 | `V5Pool.sol` | A two-token pool built on the hall, with a weighted curve for general pairs or the amplified curve for peg pairs. Swap fees go to the hall's ledger and to the venue, never into reserves. Joining opens a position; there is no LP token. The fee moves inside bounds, and the venue cut can set itself. |
+| `TuningFork.sol` | The directional fee for peg pools: cheap toward the pitch, dearer the further away, charged over the whole price move. A fee model the pool consults on swaps. |
+| `DepegWatch.sol` | Reports when an outside price has been off its peg for a full window. While it does, exits are free. |
 | `VenueSplitter.sol` | Divides one pool's venue cut between the build fund, protocol-owned liquidity, prizes and the buyback line. Before the token exists, half the buyback line goes back to the pool's LPs and half is banked in the escrow, up to the pool's cap. |
 | `BankEscrow.sol` | Holds the banked half, one per chain. It can only hold, release slowly to one fixed address, pause, and refund. |
 | `TimelockedDeployer.sol` | The only way later-written contracts (the outlet, the Engine, the token) can arrive. Their addresses are fixed from day one; their code must be published and wait out a delay. |
@@ -74,7 +76,7 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 
 ## What the tests cover
 
-76 tests in `test/`, no test library needed.
+92 tests in `test/`, no test library needed.
 
 - **Against brute force.** Random opens, exits, collections and fees over 30 epochs, 512 runs. A slow calculation that walks every position every epoch must agree with the hall, the hall may never pay out more than came in, and rounding may never favour a position.
 - **The simulator's named cases**, with the same numbers: the early-exit forfeit, a transfer inside the horizon, a merge.
@@ -83,6 +85,8 @@ These are the reviewer's picks from the simulator runs in `docs/rulings-needed.m
 - **The venue cut's lines**: each receives its share to the wei, the LPs' half comes back as fees, and the lines must add up.
 - **The settings**: a pool opens on the defaults; a change reaches only new positions; the fee falls in a day and rises in fourteen; the venue cut steps up in a busy pool and down in a quiet one; tolls and the lock budget reach lockers by size; settings can be frozen.
 - **The amplified curve**: it matches values computed independently outside Solidity, where the invariant was checked against the curve's equation to better than one part in 10^24; over 20,000 random cases no swap shrinks the invariant and no there-and-back trade returns more than went in; a peg pool pays far more than a weighted one for the same trade; tokens with 6 and 18 decimals trade at the peg.
+- **The tuning fork**: toward the pitch pays the floor; away pays more the further it goes, up to the cap; a trade that crosses the pitch is charged for each part of the way; the swap still pays exactly the quote. Over 3,000 random cases, cutting a trade in two changed the fee by less than a thousandth and left the trader better off by less than a millionth of the trade.
+- **The depeg watch**: one bad reading is not a depeg; a full window outside, watched throughout, is; a reading back inside or a long silence starts the clock over; during a depeg a locked position leaves free; a watch that fails cannot block an exit.
 - **The deployer**: a slot's address is known before anything is deployed there; only the published code can arrive, only after the delay, only once; the outlet cannot arrive after the sunset.
 - **The escrow**: per-pool ledgers and caps; no release without the published outlet, in its first epoch, or while another deploy waits; releases come from every pool in proportion; one member pauses, a threshold unpauses after a delay, a rogue member is removed at once but never while a deploy waits; both refund triggers; a pool that lies cannot take another pool's money; a stray transfer cannot dilute later depositors.
 - **Deferred claims with a real pool**: a late depositor gets only its share of the epochs it was in; a claim stays with the seller of a position and survives closing it; after a partial draw the rest is split by the same claims.
@@ -107,6 +111,14 @@ These are about how the contracts are built, not what they are set to.
 7. **Two tokens only.** Tokens that take a fee on transfer or change balances by themselves are not supported.
 8. **All rounding is against the position or the trader.**
 
+On the fork and the depeg watch:
+
+- **The fork is a separate contract the pool consults**, not code inside the pool. That keeps the pool under its size limit and means a pool can run with no fork or a different fee model. It is on the swap path only and cannot touch an exit.
+- **The whole fee, surcharge included, goes down the usual waterfall.** The spec leaves a separate LP/POL split of the directional fee as a config field; it is not built.
+- **"Charged over the whole move" is an average along the trade weighted by amount traded**, taken at three points. It is close to exact, not exact.
+- **A fork costs gas**: three passes over the curve per swap instead of one.
+- **The depeg watch needs people to call it.** It reports a depeg only if readings kept coming in throughout the window.
+
 Where the escrow departs from spec v1.16, on purpose:
 
 9. **The cap is per pool, not per chain.** Anyone may bank for any pool, so one chain-wide cap could be filled by a stranger to push every real pool's share to its LPs instead.
@@ -124,12 +136,13 @@ Where the escrow departs from spec v1.16, on purpose:
 - The outlet, the Engine and the token themselves. The escrow and deployer are ready for them; they are later-phase contracts.
 - A router, and per-transaction permits.
 - A timelock in front of the configurer, and anything that moves the fee automatically.
-- The depeg waiver and the tuning-fork fee. The amplified curve is built; its amplification is fixed per pool and cannot be ramped.
+- An outside price source. The fork's pitch and the depeg watch both read one through a one-function interface; no adapter to a real oracle exists yet.
+- Ramping the amplified curve's amplification, which is fixed per pool.
 - A shared hall, the token, locks on the token, gauges.
 - Deployment scripts and the deterministic addresses.
 
 ## Gas and size, first reading
 
-The contracts are now compiled through the IR pipeline, which shrank the pool by about 3,500 bytes. With the amplified curve added it stands at about 21,200 against a limit of 24,576. One side effect matters for tests only: a test that moves the clock must read the time through the cheatcode, as `test/Base.sol` does.
+The contracts are now compiled through the IR pipeline, which shrank the pool by about 3,500 bytes. With the amplified curve, the fee-model hook and the depeg waiver added it stands at about 23,000 against a limit of 24,576. It is full: the next thing that belongs inside the pool means splitting it first. One side effect matters for tests only: a test that moves the clock must read the time through the cheatcode, as `test/Base.sol` does.
 
 A swap is about 200,000 gas, a join about 358,000, an exit about 300,000. That is high. Every setting is read from storage on every call, and the hall's catch-up to the current epoch is inside each. Nothing has been tuned, and fixing settings into the code later will bring it down.

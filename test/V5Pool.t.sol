@@ -30,12 +30,12 @@ abstract contract PoolSetup is Base {
     /// A fee between 0.1% and 0.3%, a flat venue cut, nothing to lockers.
     function _feePolicy() internal pure returns (V5Pool.FeePolicy memory) {
         return V5Pool.FeePolicy(
-            0.001e18, 0.003e18, 1 days, 14 days, false, 0.5e18, 0.06e18, 0.05e18, 0.4e18, 0.05e18, 7 days, 0
+            0.001e18, 0.003e18, 1 days, 14 days, false, 0.5e18, 0.06e18, 0.05e18, 0.4e18, 0.05e18, 7 days, 0, address(0)
         );
     }
 
     function _roles() internal view returns (V5Pool.Roles memory) {
-        return V5Pool.Roles(venue, pol, guardian, capRaiser, configurer, feeSetter, bankRole);
+        return V5Pool.Roles(venue, pol, guardian, capRaiser, configurer, feeSetter, bankRole, address(0));
     }
 
     function _pool(uint256 weight0, uint256 cap) internal returns (V5Pool) {
