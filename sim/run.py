@@ -21,7 +21,14 @@ ROWS = [
     ("seasoned_share_pct", "TVL that is fully seasoned (%)"),
     ("volume", "Volume ($)"),
     ("hard_share_pct", "TVL that is hard-locked (%)"),
-    ("shock_retained_pct", "Liquidity still there after the shock (%)"),
+    ("At the shock", None),
+    ("shock_seasoned_mix_pct", "LP capital that was fully seasoned (%)"),
+    ("shock_hard_mix_pct", "LP capital that was hard-locked (%)"),
+    ("shock_retained_pct", "Liquidity still there afterwards (%)"),
+    ("shock_kept_seasoned_pct", "  of seasoned capital (%)"),
+    ("shock_kept_fresh_pct", "  of fresh capital (%)"),
+    ("shock_kept_hard_pct", "  of hard-locked capital (%)"),
+    ("shock_kept_soft_pct", "  of unlocked capital (%)"),
     ("Who gets in (% of capital offered)", None),
     ("accepted_hot_pct", "Hot money, stays days"),
     ("accepted_medium_pct", "Medium, stays weeks"),
@@ -66,7 +73,13 @@ def parse_sets(pairs):
 
 
 def scenario(p, seeds, name):
-    a, b = average(p, seeds), average(p.plain(), seeds)
+    ea, eb = {}, {}
+    a, b = average(p, seeds, ea), average(p.plain(), seeds, eb)
+
+    def cell(key, vals, errs):
+        text = fmt(key, vals[key])
+        return f"{text} ±{errs[key]:.1f}" if key.startswith("shock_") and key in errs else text
+
     lock = f", hard lock {p.hard_lock_days:g} days" if p.hard_lock_days else ""
     print(f"{name}: floor {p.floor}, horizon {p.horizon_days:g} days{lock}, {p.days} days, mean of {seeds} runs\n")
     print(f"{'':50}{'V5':>14}{'Plain pool':>14}")
@@ -74,7 +87,7 @@ def scenario(p, seeds, name):
         if label is None:
             print(f"\n{key}")
         else:
-            print(f"  {label:48}{fmt(key, a[key]):>14}{fmt(key, b[key]):>14}")
+            print(f"  {label:48}{cell(key, a, ea):>14}{cell(key, b, eb):>14}")
 
 
 def sweep(p, seeds, name):

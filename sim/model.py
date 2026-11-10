@@ -124,7 +124,7 @@ def run(p: Params):
     late = [0.0, 0.0]   # long capital offered and accepted in the second half
     pol_cash = prize_pot = pol_seen = 0.0
     seasoned_days, tvl_days, hard_days = [], [], []
-    shock_retained = float("nan")
+    shock = {}   # what the pool looked like at the shock, and who stayed
 
     def tvl():
         return shares * index()
@@ -181,6 +181,15 @@ def run(p: Params):
             if volatile:
                 price *= 1 - p.shock_drop_pct / 100
             before = shares
+            groups = {"seasoned": [0.0, 0.0], "fresh": [0.0, 0.0], "hard": [0.0, 0.0], "soft": [0.0, 0.0]}
+
+            def tally(m, col):
+                if m["kind"] in KINDS:
+                    groups["seasoned" if hall.e - m["e_in"] >= H else "fresh"][col] += m["s"]
+                    groups[m["tier"]][col] += m["s"]
+
+            for m in meta.values():
+                tally(m, 0)
             for pid in [k for k, m in meta.items() if m["kind"] in KINDS]:
                 if rng.random() < p.passive_pct / 100:
                     continue
@@ -192,7 +201,14 @@ def run(p: Params):
                 fear = rng.uniform(0, p.shock_fear_pct) / 100 * value
                 if fear > cost + value * p.inertia_pct / 100:
                     close(pid)
-            shock_retained = 100 * shares / before
+            for m in meta.values():
+                tally(m, 1)
+            lp_before = groups["seasoned"][0] + groups["fresh"][0]
+            shock["shock_retained_pct"] = 100 * shares / before
+            shock["shock_seasoned_mix_pct"] = 100 * groups["seasoned"][0] / lp_before if lp_before else float("nan")
+            shock["shock_hard_mix_pct"] = 100 * groups["hard"][0] / lp_before if lp_before else float("nan")
+            for g, (was, now) in groups.items():
+                shock[f"shock_kept_{g}_pct"] = 100 * now / was if was else float("nan")
 
         # LPs whose planned stay is over leave.
         for pid in [k for k, m in meta.items() if m["e_out"] is not None and m["e_out"] <= hall.e]:
@@ -288,7 +304,9 @@ def run(p: Params):
     out["tvl_avg"] = sum(tvl_days) / len(tvl_days)
     out["seasoned_share_pct"] = 100 * sum(seasoned_days) / len(seasoned_days) if seasoned_days else float("nan")
     out["hard_share_pct"] = 100 * sum(hard_days) / len(hard_days)
-    out["shock_retained_pct"] = shock_retained
+    for k in ("shock_retained_pct", "shock_seasoned_mix_pct", "shock_hard_mix_pct", "shock_kept_seasoned_pct",
+              "shock_kept_fresh_pct", "shock_kept_hard_pct", "shock_kept_soft_pct"):
+        out[k] = shock.get(k, float("nan"))
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
 
     # Growth-trap probe: over one horizon starting mid-run, what does a brand-new
@@ -304,10 +322,15 @@ def simulate(p: Params):
     return run(p)[0]
 
 
-def average(p: Params, seeds):
+def average(p: Params, seeds, errors=None):
+    """Mean of each result over `seeds` runs. If `errors` is a dict it is filled
+    with the standard error of each mean."""
     runs = [simulate(p.but(seed=p.seed + s)) for s in range(seeds)]
     out = {}
     for k in runs[0]:
         vals = [r[k] for r in runs if r[k] == r[k]]
         out[k] = sum(vals) / len(vals) if vals else float("nan")
+        if errors is not None and len(vals) > 1:
+            var = sum((v - out[k]) ** 2 for v in vals) / (len(vals) - 1)
+            errors[k] = math.sqrt(var / len(vals))
     return out
