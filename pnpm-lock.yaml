@@ -1,0 +1,87 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@foundry-rs/forge':
+        specifier: 1.7.1
+        version: 1.7.1
+      solady:
+        specifier: latest
+        version: 0.1.26
+
+packages:
+
+  '@foundry-rs/forge-darwin-amd64@1.7.1':
+    resolution: {integrity: sha512-0P18bZyXiCJ5YJMQ+FgOE3WToqt7qBp8eyeBWFAIHX79hwN8RWtvdBWJ6ZcYH14lWZVuN8oYi8Wkth/t3jAa8g==}
+    engines: {node: '>=20'}
+    cpu: [x64]
+    os: [darwin]
+    hasBin: true
+
+  '@foundry-rs/forge-darwin-arm64@1.7.1':
+    resolution: {integrity: sha512-PwvdcKxniBoIic163Gw8t7rIOfE8ZfV2mCM2WOXnGdsUbCJRvkqCWq4qidkUORbibhfiRTyw3991hMFL8/qEfw==}
+    engines: {node: '>=20'}
+    cpu: [arm64]
+    os: [darwin]
+    hasBin: true
+
+  '@foundry-rs/forge-linux-amd64@1.7.1':
+    resolution: {integrity: sha512-/HQddyTanVOJKgvilmZrf8VOf7mhvwrWb59W73w5W5flX7b6zNh9CR6hKZzJwiRRi5Sxk/JOFEYIeKsQx7Teqg==}
+    engines: {node: '>=20'}
+    cpu: [x64]
+    os: [linux]
+    hasBin: true
+
+  '@foundry-rs/forge-linux-arm64@1.7.1':
+    resolution: {integrity: sha512-jt+6H8AWHauP8kP+miMKJkMjC6UCHm6NRjO5D+5ca416o6iJGPURNs+Nlb0WWnb1gaCj7sXUZqpxH73Ub+YBWg==}
+    engines: {node: '>=20'}
+    cpu: [arm64]
+    os: [linux]
+    hasBin: true
+
+  '@foundry-rs/forge-win32-amd64@1.7.1':
+    resolution: {integrity: sha512-WK+gWWlWYpgrsrKcle4hzV5k5TPoVE8acsnNnmckQhvcbcZBG2VukpkqFCJgOpPX1xuSYtskHTIhJbCx1w854w==}
+    engines: {node: '>=20'}
+    cpu: [x64]
+    os: [win32]
+    hasBin: true
+
+  '@foundry-rs/forge@1.7.1':
+    resolution: {integrity: sha512-ji244KYCP15RTaHg/V3VpTarX+8Tl7qm54B8laVeabbUMKhsJI5QK28gh5fbTxndB7tdsnbliwdrx/FwAXzEoA==}
+    hasBin: true
+
+  solady@0.1.26:
+    resolution: {integrity: sha512-dhGr/ptJFdea/1KE6xgqgwEdbMhUiSfRc6A+jLeltPe16zyt9qtED3PElIBVRnzEmUO5aZTjKVAr6SlqXBBcIw==}
+
+snapshots:
+
+  '@foundry-rs/forge-darwin-amd64@1.7.1':
+    optional: true
+
+  '@foundry-rs/forge-darwin-arm64@1.7.1':
+    optional: true
+
+  '@foundry-rs/forge-linux-amd64@1.7.1':
+    optional: true
+
+  '@foundry-rs/forge-linux-arm64@1.7.1':
+    optional: true
+
+  '@foundry-rs/forge-win32-amd64@1.7.1':
+    optional: true
+
+  '@foundry-rs/forge@1.7.1':
+    optionalDependencies:
+      '@foundry-rs/forge-darwin-amd64': 1.7.1
+      '@foundry-rs/forge-darwin-arm64': 1.7.1
+      '@foundry-rs/forge-linux-amd64': 1.7.1
+      '@foundry-rs/forge-linux-arm64': 1.7.1
+      '@foundry-rs/forge-win32-amd64': 1.7.1
+
+  solady@0.1.26: {}
