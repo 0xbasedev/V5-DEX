@@ -4,8 +4,10 @@ Python 3, standard library only. Nothing to install.
 
 ```
 python3 -m unittest sim.test_hall -v     # the first test: claim maths, exact
-python3 -m sim.run                       # one scenario against a plain pool
-python3 -m sim.run --sweep               # floor x horizon grid -> sim/out/sweep.csv
+python3 -m unittest sim.test_model       # sanity checks on the scenario model
+python3 -m sim.run                       # the stable scenario against a plain pool
+python3 -m sim.run --scenario shock      # stable | tight | volatile | shock | hardlock
+python3 -m sim.run --sweep               # floor x horizon grid -> sim/out/sweep-<scenario>.csv
 python3 -m sim.run --set floor=0.6 --set horizon_days=14 --seeds 20
 ```
 
@@ -16,6 +18,7 @@ python3 -m sim.run --set floor=0.6 --set horizon_days=14 --seeds 20
 | `hall.py` | The Epoch Hall's bookkeeping, twice: the constant-time version a contract would use, and a brute-force version. |
 | `test_hall.py` | Runs both on the same operations with exact fractions and requires equality. Covers the cases listed in spec v1.16 O5. |
 | `model.py` | One V5 pool, a fee waterfall, and a stream of LPs who each decide whether to enter. |
+| `test_model.py` | Checks that every scenario accounts for every fee and every banked dollar. |
 | `run.py` | Command line: a scenario table, or a parameter sweep. |
 
 ## The first test
@@ -41,19 +44,33 @@ The spec leaves these open. They are choices made here, not rulings, and `hall.p
 - Held fees travel with a transferred position. Deferred claims stay with the wallet.
 - Compounding is in whole units; one unit of fees buys one unit of shares.
 
+## Scenarios
+
+| Name | What it sets up |
+|---|---|
+| `stable` | A stable pair with plenty of volume. The default. |
+| `tight` | The same pair with thin volume, so the pool pays about what LPs can get elsewhere. |
+| `volatile` | A 50/50 pair with a moving price, a higher fee and less organic volume. |
+| `shock` | `volatile`, plus a 30% price fall on day 90 that makes LPs consider leaving. |
+| `hardlock` | `shock`, with a 90-day hard-lock tier on offer. |
+
+Any parameter can be overridden with `--set name=value`, and `--sweep` works with any scenario.
+
 ## What the model assumes
 
 The scenario numbers are only as good as these. All are parameters in `model.py`.
 
-- One pool. One share is one dollar: no price moves and no impermanent loss.
-- Volume grows with depth (to the power 0.6 by default) with random noise.
-- LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate. They leave when their planned stay ends.
+- One pool. One share is one dollar on a stable pair. On a volatile pair the pool is 50/50, the price follows a random walk, and each LP's loss against simply holding is tracked.
+- Organic volume grows with depth (to the power 0.6 by default) with random noise. A moving price adds the trading needed to keep the pool at the market price.
+- LPs arrive at random with a size, a planned stay (days, weeks or months) and an outside rate they could earn elsewhere. Each enters only if the pool's recent fee pace, the weight ramp, the fee hold and any toll leave them above that rate, plus the expected loss to price moves. They leave when their planned stay ends.
+- In a shock, 60% of LPs do nothing. Each of the rest fears losing up to 5% of their position and leaves if that fear is larger than what leaving costs them.
+- A hard-locked position seasons on the same ramp with a weight multiplier, and pays a share of principal to leave early that melts to zero over the term. An LP takes the lock only if it plans to stay the whole term and the lock pays enough more.
 - Anchor tenants are in from day one and never leave.
-- The venue's POL line and the POL share of forfeits are deposited as liquidity daily.
+- The venue's POL line, and the POL share of forfeits and tolls, are deposited as liquidity daily.
 - The prize slice is paid to the Hall every 30 days as ordinary fees, which approximates "by seasoned weight over the month".
 - Pre-token only: half the buyback line goes to LPs, half is banked up to the holding cap.
 
-Not modelled yet: the hard-lock tier, the tuning-fork fee, price risk, the token phase, more than one pool, and LPs who react to each other or to a shock.
+Not modelled yet: the tuning-fork fee, the depeg waiver, the token phase, more than one pool, compounding vaults, and LPs who react to each other.
 
 ## Reading the output
 

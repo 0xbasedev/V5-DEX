@@ -15,12 +15,18 @@ KINDS = ("hot", "medium", "long")
 
 @dataclass
 class Params:
-    # --- seasoning (spec §18.3, all OPEN) ---
+    # --- seasoning, soft tier (spec §18.3, all OPEN) ---
     floor: float = 0.4               # weight of a brand-new position, as a share of full weight
     horizon_days: float = 28         # days to full weight and free exit
     u0: float = 0.4                  # share of earned fees unlocked at age zero
-    pol_share_pct: float = 30        # share of forfeits that becomes POL; the rest goes to seasoned weight
+    pol_share_pct: float = 30        # share of forfeits and tolls that becomes POL; the rest goes to seasoned weight
     principal_floor_pct: float = 0   # anti-churn principal toll at age zero, melting to zero at the horizon
+
+    # --- hard-lock tier (spec §3, all OPEN; 0 days switches it off) ---
+    hard_lock_days: float = 0
+    hard_boost: float = 1.5          # weight multiplier for a locked position
+    hard_exit_pct: float = 5         # principal cost of leaving at day zero, melting to zero at the end of the term
+    lock_premium_pct: float = 2      # extra APR an LP wants before accepting a lock
 
     # --- fees (spec §18.4, all OPEN) ---
     gross_fee_pct: float = 0.05      # of volume
@@ -34,11 +40,17 @@ class Params:
     # --- market (assumptions) ---
     days: int = 180
     epochs_per_day: int = 4
-    volume_at_ref: float = 2_000_000     # daily volume when TVL equals tvl_ref
+    volume_at_ref: float = 2_000_000     # organic daily volume when TVL equals tvl_ref
     tvl_ref: float = 1_000_000
-    depth_elasticity: float = 0.6        # volume grows with TVL to this power
+    depth_elasticity: float = 0.6        # organic volume grows with TVL to this power
     volume_sigma: float = 0.35           # per-epoch noise
     anchor_tvl: float = 500_000          # anchor tenants, in from day one and never leaving
+    annual_vol_pct: float = 0            # price volatility of the pair; 0 is a stable pair
+    shock_day: int = -1                  # day of a one-off market shock; -1 for none
+    shock_drop_pct: float = 30           # price fall on that day
+    shock_fear_pct: float = 5            # LPs each fear losing up to this much of their position
+    inertia_pct: float = 0.05            # fear below this never moves anyone
+    passive_pct: float = 60              # LPs who do not react to a shock at all
 
     # --- LPs (assumptions) ---
     arrivals_per_day: float = 3
@@ -54,11 +66,23 @@ class Params:
 
     seed: int = 0
 
-    def plain(self):
-        """The same pool with seasoning switched off: the comparison case."""
+    def but(self, **changes):
         d = asdict(self)
-        d.update(floor=1.0, u0=1.0, principal_floor_pct=0.0)
+        d.update(changes)
         return Params(**d)
+
+    def plain(self):
+        """The same pool with seasoning and locks switched off: the comparison case."""
+        return self.but(floor=1.0, u0=1.0, principal_floor_pct=0.0, hard_lock_days=0)
+
+
+SCENARIOS = {
+    "stable": dict(),
+    "tight": dict(volume_at_ref=450_000),
+    "volatile": dict(annual_vol_pct=70, gross_fee_pct=0.30, volume_at_ref=300_000),
+    "shock": dict(annual_vol_pct=70, gross_fee_pct=0.30, volume_at_ref=300_000, shock_day=90),
+    "hardlock": dict(annual_vol_pct=70, gross_fee_pct=0.30, volume_at_ref=300_000, shock_day=90, hard_lock_days=90),
+}
 
 
 def _poisson(rng, lam):
@@ -69,66 +93,110 @@ def _poisson(rng, lam):
     return k
 
 
-def simulate(p: Params):
+def run(p: Params):
+    """Returns (results, hall). Use `simulate` unless you need the Hall itself."""
     rng = random.Random(p.seed)
     E = p.epochs_per_day
     H = max(1, round(p.horizon_days * E))
+    term = round(p.hard_lock_days * E)
     hall = AccHall(p.floor, H, p.u0, p.pol_share_pct / 100)
     per_year = 365 * E
+    volatile = p.annual_vol_pct > 0
+    sig = p.annual_vol_pct / 100 / math.sqrt(per_year)
+    il_drag = (p.annual_vol_pct / 100) ** 2 / 8 * 100   # expected yearly loss to price moves, %
+    pol_cut = p.pol_share_pct / 100
 
-    meta = {}     # pid -> [kind, shares, epoch in, planned epoch out]
-    done = []     # (kind, shares, epochs held, net cash, entry epoch)
-    tvl = 0.0
+    price = 1.0
+    index = lambda: math.sqrt(price) if volatile else 1.0      # dollars per share (50/50 pool)
+
+    def price_loss(m):
+        """Dollars a position is behind simply holding the two assets it came in with."""
+        r = price / m["price_in"]
+        return m["size"] * ((1 + r) / 2 - math.sqrt(r))
+
+    meta = {}     # pid -> dict
+    done = []     # dict per finished or still-open position
+    shares = 0.0  # real shares in the pool; weight boosts live only in the Hall
     out = dict(volume=0.0, lp_fees=0.0, build=0.0, banked=0.0, bank_overflow_to_lps=0.0,
-               forfeited_fees=0.0, principal_tolls=0.0, pol_value=0.0)
+               forfeited_fees=0.0, principal_tolls=0.0)
     offered = {k: 0.0 for k in KINDS}
     accepted = {k: 0.0 for k in KINDS}
-    pol_cash = prize_pot = 0.0
-    pol_seen = 0.0
-    seasoned_days = []
-    tvl_days = []
+    late = [0.0, 0.0]   # long capital offered and accepted in the second half
+    pol_cash = prize_pot = pol_seen = 0.0
+    seasoned_days, tvl_days, hard_days = [], [], []
+    shock_retained = float("nan")
 
-    def open_position(kind, size, hold_epochs):
-        nonlocal tvl
-        pid = hall.deposit(kind, size)
-        meta[pid] = [kind, size, hall.e, None if hold_epochs is None else hall.e + hold_epochs]
-        tvl += size
+    def tvl():
+        return shares * index()
 
-    def daily_volume(depth):
+    def open_position(kind, size, stay, tier="soft"):
+        nonlocal shares
+        s = size / index()
+        pid = hall.deposit(kind, s * (p.hard_boost if tier == "hard" else 1.0))
+        meta[pid] = dict(kind=kind, s=s, size=size, e_in=hall.e, tier=tier, price_in=price,
+                         e_out=None if stay is None else hall.e + stay)
+        shares += s
+
+    def toll_rate(m, age):
+        if m["tier"] == "hard":
+            return p.hard_exit_pct / 100 * max(0.0, 1 - age / term)
+        return p.principal_floor_pct / 100 * max(0.0, 1 - age / H)
+
+    def close(pid):
+        nonlocal shares, pol_cash
+        m = meta.pop(pid)
+        age = hall.e - m["e_in"]
+        value = m["s"] * index()
+        cash, forfeited = hall.exit(pid)
+        toll = value * toll_rate(m, age)
+        pol_cash += toll * pol_cut
+        hall.add_fees(toll * (1 - pol_cut))
+        out["forfeited_fees"] += forfeited
+        out["principal_tolls"] += toll
+        shares -= m["s"]
+        done.append(dict(m, t=age, fees=cash - toll, il=price_loss(m)))
+
+    def organic_volume(depth):
         return p.volume_at_ref * (depth / p.tvl_ref) ** p.depth_elasticity
 
-    def hall_fees_per_epoch(depth):
-        gross = daily_volume(depth) / E * p.gross_fee_pct / 100
-        return gross * (1 - p.venue_cut_pct / 100 * (1 - p.buyback_pct / 200))
-
-    def expected_apr(size, T):
+    def expected_apr(size, T, tier):
         """What a newcomer expects over a stay of T epochs if fees keep their recent pace."""
         if T <= H:
             sum_w = T * p.floor + (1 - p.floor) * (T * (T - 1) / 2) / H
         else:
             sum_w = H * p.floor + (1 - p.floor) * (H - 1) / 2 + (T - H)
-        per_weight = rate / (hall.W + size * sum_w / T)
-        kept = size * per_weight * sum_w * ramp(p.u0, T, H)
-        toll = size * p.principal_floor_pct / 100 * max(0.0, 1 - T / H)
+        s = size / index() * (p.hard_boost if tier == "hard" else 1.0)
+        per_weight = rate / (hall.W + s * sum_w / T)
+        kept = s * per_weight * sum_w * ramp(p.u0, T, H)
+        toll = 0.0 if tier == "hard" else size * p.principal_floor_pct / 100 * max(0.0, 1 - T / H)
         return (kept - toll) / size * per_year / T * 100
 
     open_position("anchor", p.anchor_tvl, None)
-    rate = hall_fees_per_epoch(tvl)   # smoothed fees reaching the Hall per epoch
+    gross0 = organic_volume(tvl()) / E * p.gross_fee_pct / 100
+    rate = gross0 * (1 - p.venue_cut_pct / 100 * (1 - p.buyback_pct / 200))   # smoothed fees reaching the Hall per epoch
     smooth = 2 / (4 * E + 1)
 
     for day in range(p.days):
+        if day == p.shock_day:
+            if volatile:
+                price *= 1 - p.shock_drop_pct / 100
+            before = shares
+            for pid in [k for k, m in meta.items() if m["kind"] in KINDS]:
+                if rng.random() < p.passive_pct / 100:
+                    continue
+                m = meta[pid]
+                value = m["s"] * index()
+                q = hall.pos[pid]
+                locked = q.earned - q.paid - hall.unlocked_now(pid)
+                cost = locked + value * toll_rate(m, hall.e - m["e_in"])
+                fear = rng.uniform(0, p.shock_fear_pct) / 100 * value
+                if fear > cost + value * p.inertia_pct / 100:
+                    close(pid)
+            shock_retained = 100 * shares / before
+
         # LPs whose planned stay is over leave.
-        for pid in [k for k, m in meta.items() if m[3] is not None and m[3] <= hall.e]:
-            kind, size, e_in, _ = meta.pop(pid)
-            age = hall.e - e_in
-            cash, forfeited = hall.exit(pid)
-            toll = size * p.principal_floor_pct / 100 * max(0.0, 1 - age / H)
-            pol_cash += toll * p.pol_share_pct / 100
-            hall.add_fees(toll * (1 - p.pol_share_pct / 100))
-            out["forfeited_fees"] += forfeited
-            out["principal_tolls"] += toll
-            tvl -= size
-            done.append((kind, size, age, cash - toll, e_in))
+        for pid in [k for k, m in meta.items() if m["e_out"] is not None and m["e_out"] <= hall.e]:
+            close(pid)
 
         # New LPs look at the pool and decide.
         for _ in range(_poisson(rng, p.arrivals_per_day)):
@@ -137,13 +205,24 @@ def simulate(p: Params):
             size = p.size_median * math.exp(rng.gauss(0, p.size_sigma))
             lo, hi = getattr(p, "hold_" + kind)
             T = max(1, round(rng.uniform(lo, hi) * E))
-            hurdle = rng.gauss(p.outside_apr_pct, p.outside_apr_sd)
+            hurdle = rng.gauss(p.outside_apr_pct, p.outside_apr_sd) + il_drag
             offered[kind] += size
-            if expected_apr(size, T) >= hurdle:
+            second_half = kind == "long" and day >= p.days // 2
+            if second_half:
+                late[0] += size
+            soft = expected_apr(size, T, "soft")
+            tier = None
+            if term and T >= term and expected_apr(size, T, "hard") >= max(hurdle, soft) + p.lock_premium_pct:
+                tier = "hard"
+            elif soft >= hurdle:
+                tier = "soft"
+            if tier:
                 accepted[kind] += size
-                open_position(kind, size, T)
+                if second_half:
+                    late[1] += size
+                open_position(kind, size, T, tier)
 
-        # The venue's POL line, and its share of forfeits, go in as liquidity.
+        # The venue's POL line, and its share of forfeits and tolls, go in as liquidity.
         pol_cash += hall.pol - pol_seen
         pol_seen = hall.pol
         if pol_cash > 0:
@@ -151,8 +230,13 @@ def simulate(p: Params):
             pol_cash = 0.0
 
         for _ in range(E):
+            arb = 0.0
+            if volatile:
+                step = sig * rng.gauss(0, 1) - sig * sig / 2
+                price *= math.exp(step)
+                arb = abs(step) * tvl() / 4   # trading needed to move a 50/50 pool to the new price
             noise = math.exp(rng.gauss(0, p.volume_sigma) - p.volume_sigma ** 2 / 2)
-            volume = daily_volume(tvl) / E * noise
+            volume = organic_volume(tvl()) / E * noise + arb
             gross = volume * p.gross_fee_pct / 100
             venue = gross * p.venue_cut_pct / 100
             buyback = venue * p.buyback_pct / 100
@@ -175,29 +259,36 @@ def simulate(p: Params):
             out["lp_fees"] += prize_pot
             prize_pot = 0.0
 
-        tvl_days.append(tvl)
+        tvl_days.append(tvl())
+        hard_days.append(sum(m["s"] for m in meta.values() if m["tier"] == "hard") / shares)
         if hall.e >= H:
-            ripe = sum(q.s for q in hall.pos.values() if hall.e - q.e0 >= H)
-            seasoned_days.append(ripe / tvl)
+            seasoned_days.append(sum(m["s"] for m in meta.values() if hall.e - m["e_in"] >= H) / shares)
 
     hall.settle_all()
-    for pid, (kind, size, e_in, _) in meta.items():
+    for pid, m in meta.items():
         # Still in at the end: count what they have earned, on the view that they stay to unlock it.
-        done.append((kind, size, hall.e - e_in, hall.pos[pid].earned, e_in))
+        done.append(dict(m, t=hall.e - m["e_in"], fees=hall.pos[pid].earned, il=price_loss(m)))
 
-    def apr(rows):
-        dollar_epochs = sum(s * t for _, s, t, _, _ in rows)
-        return sum(c for *_, c, _ in rows) / dollar_epochs * per_year * 100 if dollar_epochs else float("nan")
+    def apr(rows, net):
+        dollar_epochs = sum(r["size"] * r["t"] for r in rows)
+        got = sum(r["fees"] - (r["il"] if net else 0.0) for r in rows)
+        return got / dollar_epochs * per_year * 100 if dollar_epochs else float("nan")
 
     for kind in KINDS + ("anchor",):
-        out["apr_" + kind] = apr([r for r in done if r[0] == kind])
-    out["pol_income"] = sum(r[3] for r in done if r[0] == "pol")
-    out["pol_value"] = sum(r[1] for r in done if r[0] == "pol")
+        rows = [r for r in done if r["kind"] == kind]
+        out["apr_" + kind] = apr(rows, False)
+        out["net_apr_" + kind] = apr(rows, True)
+    pol = [r for r in done if r["kind"] == "pol"]
+    out["pol_income"] = sum(r["fees"] for r in pol)
+    out["pol_value"] = sum(r["s"] for r in pol) * index()
     for kind in KINDS:
         out["accepted_" + kind + "_pct"] = 100 * accepted[kind] / offered[kind] if offered[kind] else float("nan")
-    out["tvl_end"] = tvl
+    out["accepted_long_late_pct"] = 100 * late[1] / late[0] if late[0] else float("nan")
+    out["tvl_end"] = tvl()
     out["tvl_avg"] = sum(tvl_days) / len(tvl_days)
     out["seasoned_share_pct"] = 100 * sum(seasoned_days) / len(seasoned_days) if seasoned_days else float("nan")
+    out["hard_share_pct"] = 100 * sum(hard_days) / len(hard_days)
+    out["shock_retained_pct"] = shock_retained
     out["venue_total"] = out["build"] + out["pol_income"] + out["pol_value"]
 
     # Growth-trap probe: over one horizon starting mid-run, what does a brand-new
@@ -205,17 +296,18 @@ def simulate(p: Params):
     e1 = (p.days // 2) * E
     e2 = min(e1 + H, hall.e)
     mature = hall.cp[e2][0] - hall.cp[e1][0]
-    fresh = hall.span(1.0, e1, e1, e2, 0, 1)
-    out["new_vs_mature_pct"] = 100 * fresh / mature if mature else float("nan")
-    out["mature_apr_mid"] = mature / (e2 - e1) * per_year * 100
-    return out
+    out["new_vs_mature_pct"] = 100 * hall.span(1.0, e1, e1, e2, 0, 1) / mature if mature else float("nan")
+    return out, hall
+
+
+def simulate(p: Params):
+    return run(p)[0]
 
 
 def average(p: Params, seeds):
-    runs = []
-    for s in range(seeds):
-        d = asdict(p)
-        d["seed"] = p.seed + s
-        runs.append(simulate(Params(**d)))
-    keys = runs[0].keys()
-    return {k: sum(r[k] for r in runs) / len(runs) for k in keys}
+    runs = [simulate(p.but(seed=p.seed + s)) for s in range(seeds)]
+    out = {}
+    for k in runs[0]:
+        vals = [r[k] for r in runs if r[k] == r[k]]
+        out[k] = sum(vals) / len(vals) if vals else float("nan")
+    return out
